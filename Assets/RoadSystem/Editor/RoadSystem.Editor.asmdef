@@ -1,0 +1,17 @@
+{
+    "name": "RoadSystem.Editor",
+    "rootNamespace": "RoadSystem.EditorTools",
+    "references": [
+        "RoadSystem.Core",
+        "RoadSystem.Geometry",
+        "RoadSystem.Runtime",
+        "Unity.InputSystem"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "autoReferenced": true,
+    "noEngineReferences": false
+}

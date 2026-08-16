@@ -1,0 +1,14 @@
+{
+    "name": "RoadSystem.Runtime",
+    "rootNamespace": "RoadSystem",
+    "references": [
+        "RoadSystem.Core",
+        "RoadSystem.Geometry",
+        "Unity.InputSystem"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "autoReferenced": true,
+    "noEngineReferences": false
+}

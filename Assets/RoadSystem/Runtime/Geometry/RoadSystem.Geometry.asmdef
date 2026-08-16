@@ -1,0 +1,12 @@
+{
+    "name": "RoadSystem.Geometry",
+    "rootNamespace": "RoadSystem.Geometry",
+    "references": [
+        "RoadSystem.Core"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "autoReferenced": true,
+    "noEngineReferences": true
+}

@@ -1,0 +1,23 @@
+{
+    "name": "RoadSystem.Tests.EditMode",
+    "rootNamespace": "RoadSystem.Tests",
+    "references": [
+        "RoadSystem.Core",
+        "RoadSystem.Geometry",
+        "RoadSystem.Runtime",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "autoReferenced": false,
+    "noEngineReferences": false
+}
