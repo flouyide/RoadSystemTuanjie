@@ -188,7 +188,8 @@ namespace RoadSystem
             seg.Path = path;
 
             var go = GetOrCreateNodeObject(seg.Id, out var mf, out var mr, out var mc);
-            go.transform.position = new Vector3((float)pa.Position.X, 0f, (float)pa.Position.Y);
+            // 几何在 XZ 2D 计算；Y 仅用于渲染抬升（取起点 profile 的 Y，避免与地面重叠）
+            go.transform.position = new Vector3((float)pa.Position.X, pa.Y, (float)pa.Position.Y);
 
             var oldMesh = mf.sharedMesh;
             var mesh = SegmentMeshBuilder.Build(path, pa.Lanes, pa.Position, sagitta, texturePeriod);

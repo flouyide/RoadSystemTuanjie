@@ -22,6 +22,12 @@ namespace RoadSystem
         [SerializeField] Camera cam; // 留空自动取 Camera.main
         [SerializeField] public bool buildEnabled = true;
 
+        [Header("地面检测")]
+        [Tooltip("射线检测的地面层（建议设为 Ground）。留空时 Awake 自动取名为 Ground 的层")]
+        [SerializeField] LayerMask groundMask;
+        [Tooltip("道路 mesh 相对地面命中点的 Y 抬高量，避免与 ground 重叠")]
+        [SerializeField] int roadYOffset = 0;
+
 #if ENABLE_INPUT_SYSTEM
         [Header("Input Action 引用（拖入 IA_RoadBuilder 资产里的 Action）")]
         [Tooltip("鼠标位置（Value/Vector2），对应 IA_RoadBuilder 的 Position")]
@@ -63,6 +69,8 @@ namespace RoadSystem
         {
             net = GetComponent<RoadNetworkBehaviour>();
             if (cam == null) cam = Camera.main;
+            if (groundMask == 0)
+                groundMask = LayerMask.GetMask("Ground"); // 未配置时自动取 Ground 层
             EnsurePreviewObjects();
         }
 
@@ -108,8 +116,9 @@ namespace RoadSystem
 
         void OnLeftClick()
         {
-            if (!GroundPoint(out DVec2 pos)) return;
+            if (!GroundPoint(out DVec2 pos, out float groundY)) return;
             pos = SnapPos(pos);
+            float roadY = groundY + roadYOffset;
 
             if (pendingStart == null)
             {
@@ -123,6 +132,7 @@ namespace RoadSystem
                 else
                 {
                     pendingStart = net.PlaceProfile(pos, DefaultDirection(), Profile.DefaultLanes());
+                    pendingStart.Y = roadY;
                     pendingStartIsNew = true;
                 }
             }
@@ -141,6 +151,7 @@ namespace RoadSystem
                 {
                     DVec2 dir = ComputeEndDirection(pos);
                     end = net.PlaceProfile(pos, dir, (LaneDef[])pendingStart.Lanes.Clone());
+                    end.Y = roadY;
                 }
 
                 var seg = net.AddSegment(pendingStart, end);
@@ -202,7 +213,7 @@ namespace RoadSystem
         void UpdatePreview()
         {
             EnsurePreviewObjects();
-            if (!GroundPoint(out DVec2 endPos))
+            if (!GroundPoint(out DVec2 endPos, out _))
             {
                 SetPreviewVisible(false);
                 return;
@@ -225,6 +236,7 @@ namespace RoadSystem
 
             DVec2 endDir = ComputeEndDirection(endPos);
             var tmpA = Profile.Create(pendingStart.Position, pendingStart.Direction, pendingStart.Lanes);
+            tmpA.Y = pendingStart.Y;
             var tmpB = Profile.Create(endPos, endDir, pendingStart.Lanes);
             var path = ProfileConnector.Connect(tmpA, tmpB);
             if (path == null)
@@ -234,8 +246,9 @@ namespace RoadSystem
             }
 
             var mesh = SegmentMeshBuilder.Build(path, pendingStart.Lanes, pendingStart.Position, 0.05f, 6f);
+            // 预览抬到起点 Y 之上一点，防 Z-fighting
             previewGo.transform.position = new Vector3(
-                (float)pendingStart.Position.X, previewLift, (float)pendingStart.Position.Y);
+                (float)pendingStart.Position.X, pendingStart.Y + previewLift, (float)pendingStart.Position.Y);
             var old = previewMf.sharedMesh;
             previewMf.sharedMesh = mesh;
             previewMr.sharedMaterial = bad ? matBad : matOk;
@@ -303,17 +316,27 @@ namespace RoadSystem
             return new DVec2(System.Math.Round(p.X / s) * s, System.Math.Round(p.Y / s) * s);
         }
 
-        bool GroundPoint(out DVec2 p)
+        bool GroundPoint(out DVec2 p, out float y)
         {
             p = DVec2.Zero;
+            y = 0f;
 #if ENABLE_INPUT_SYSTEM
-            if (PointAction == null) return false;
+            if (PointAction == null || cam == null) return false;
             Ray ray = cam.ScreenPointToRay(PointAction.ReadValue<Vector2>());
-            if (Mathf.Abs(ray.direction.y) < 1e-6f) return false;
-            float t = -ray.origin.y / ray.direction.y;
-            if (t < 0) return false;
-            Vector3 hit = ray.origin + ray.direction * t;
-            p = new DVec2(hit.x, hit.z);
+            // 射线打到 groundMask 层（默认 Ground）的第一个物体
+            if (groundMask == 0 || !Physics.Raycast(ray, out var hit, 2000f, groundMask))
+            {
+                // 未配置地面层或没命中：回退到 y=0 平面
+                if (Mathf.Abs(ray.direction.y) < 1e-6f) return false;
+                float t = -ray.origin.y / ray.direction.y;
+                if (t < 0) return false;
+                Vector3 hit0 = ray.origin + ray.direction * t;
+                p = new DVec2(hit0.x, hit0.z);
+                y = 0f;
+                return true;
+            }
+            p = new DVec2(hit.point.x, hit.point.z);
+            y = hit.point.y;
             return true;
 #else
             return false;

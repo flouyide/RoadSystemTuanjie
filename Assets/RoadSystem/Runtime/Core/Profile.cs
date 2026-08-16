@@ -14,6 +14,9 @@ namespace RoadSystem.Core
         public DVec2 Direction; // 单位向量，指向道路前进方向（垂直于 profile 线）
         public LaneDef[] Lanes;
 
+        /// <summary>渲染用的世界 Y（几何仍在 XZ 平面 2D 计算；Y 仅决定 mesh 抬升高度，避免与地面重叠）。</summary>
+        public float Y;
+
         /// <summary>两端所属的实体节点 Id（segment / intersection），可为空表示悬空端。</summary>
         public string NodeAId;
         public string NodeBId;

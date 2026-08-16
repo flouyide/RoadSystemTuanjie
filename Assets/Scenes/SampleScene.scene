@@ -478,7 +478,7 @@ GameObject:
   - component: {fileID: 1387077071}
   - component: {fileID: 1387077070}
   - component: {fileID: 1387077069}
-  m_Layer: 0
+  m_Layer: 6
   m_HasEditorInfo: 1
   m_Name: Plane
   m_TagString: Untagged
@@ -642,6 +642,10 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   cam: {fileID: 330585545}
   buildEnabled: 1
+  groundMask:
+    serializedVersion: 2
+    m_Bits: 64
+  roadYOffset: 2
   positionActionRef: {fileID: -5131329388292180580, guid: 5635270fdd6b5bb429fdc17188e09c47,
     type: 3}
   clickActionRef: {fileID: -5460131357400016873, guid: 5635270fdd6b5bb429fdc17188e09c47,

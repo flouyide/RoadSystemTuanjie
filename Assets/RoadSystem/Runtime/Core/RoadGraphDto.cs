@@ -14,6 +14,7 @@ namespace RoadSystem.Core
         public DVec2 Position;
         public DVec2 Direction;
         public LaneDef[] Lanes;
+        public float Y;
         public string NodeAId;
         public string NodeBId;
     }
@@ -48,6 +49,7 @@ namespace RoadSystem.Core
                     Position = p.Position,
                     Direction = p.Direction,
                     Lanes = p.Lanes,
+                    Y = p.Y,
                     NodeAId = p.NodeAId,
                     NodeBId = p.NodeBId
                 });
@@ -78,6 +80,7 @@ namespace RoadSystem.Core
                     Position = pd.Position,
                     Direction = pd.Direction,
                     Lanes = pd.Lanes,
+                    Y = pd.Y,
                     NodeAId = pd.NodeAId,
                     NodeBId = pd.NodeBId
                 };
