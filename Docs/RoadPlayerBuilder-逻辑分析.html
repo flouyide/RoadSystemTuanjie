@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RoadPlayerBuilder.cs 逻辑分析</title>
+<style>
+  :root{
+    --bg:#ffffff; --fg:#1d2733; --muted:#5b6b7c; --line:#e2e8f0;
+    --accent:#1f6feb; --code-bg:#f4f6fb; --warn:#c0392b; --ok:#1e8e5a; --chip:#eef3fb;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    color:var(--fg);background:var(--bg);line-height:1.65}
+  header{padding:26px 32px 18px;border-bottom:2px solid var(--line)}
+  header h1{margin:0 0 6px;font-size:23px}
+  header .sub{color:var(--muted);font-size:13px}
+  main{max-width:980px;margin:0 auto;padding:24px 32px 80px}
+  h2{font-size:18px;margin:38px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+  h3{font-size:15px;margin:22px 0 8px;color:#243b53}
+  p{margin:8px 0}
+  code{background:var(--code-bg);padding:1px 6px;border-radius:4px;font-size:13px;
+    font-family:"SF Mono",Consolas,Menlo,monospace}
+  pre{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;
+    padding:14px 16px;overflow:auto;font-size:12.5px;line-height:1.55;
+    font-family:"SF Mono",Consolas,Menlo,monospace}
+  pre .c{color:#8a94a6} pre .k{color:#8e44ad} pre .n{color:#b9770e}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:var(--chip);font-weight:600}
+  .note{border-left:4px solid var(--accent);background:#f6f9ff;padding:10px 14px;
+    margin:14px 0;border-radius:0 6px 6px 0;font-size:13.5px}
+  .warn{border-left:4px solid var(--warn);background:#fdf2f0;padding:10px 14px;
+    margin:14px 0;border-radius:0 6px 6px 0;font-size:13.5px}
+  .ok{border-left:4px solid var(--ok);background:#f0faf4;padding:10px 14px;
+    margin:14px 0;border-radius:0 6px 6px 0;font-size:13.5px}
+  .meta{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+  .meta span{background:var(--chip);border:1px solid var(--line);border-radius:20px;
+    padding:4px 12px;font-size:12.5px;color:#243b53}
+  svg{display:block;max-width:100%;height:auto;margin:14px 0;background:#fbfcfe;
+    border:1px solid var(--line);border-radius:8px}
+  ol.steps{counter-reset:s;padding-left:0;list-style:none}
+  ol.steps>li{counter-increment:s;position:relative;padding:10px 12px 10px 46px;
+    margin:8px 0;border:1px solid var(--line);border-radius:8px;background:#fcfdff}
+  ol.steps>li::before{content:counter(s);position:absolute;left:12px;top:10px;
+    width:22px;height:22px;background:var(--accent);color:#fff;border-radius:50%;
+    display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700}
+</style>
+</head>
+<body>
+<header>
+  <h1>RoadPlayerBuilder.cs 逻辑分析</h1>
+  <div class="sub">运行时建造层（L2）· 346 行 · 逐入口到结尾的逐步拆解</div>
+  <div class="meta">
+    <span>路径：Assets/RoadSystem/Runtime/RoadPlayerBuilder.cs</span>
+    <span>类型：MonoBehaviour（Play 模式）</span>
+    <span>宿主：RequireComponent(RoadNetworkBehaviour)</span>
+    <span>输入：Unity Input System</span>
+  </div>
+</header>
+<main>
+
+<h2>0. 它是什么</h2>
+<p>这是<b>运行时</b>（Play 模式）画路的脚本，挂在 <code>RoadNetworkBehaviour</code> 同一物体上（第 18 行 <code>[RequireComponent]</code>）。它和编辑器层的 <code>RoadPlacementTool</code> 是"双胞胎"——交互语义几乎一致（单击放起点 → 实时预览 → 再单击连段 → 链式延伸），但有三个本质区别：</p>
+<table>
+<tr><th>维度</th><th>RoadPlacementTool（编辑器）</th><th>RoadPlayerBuilder（运行时）</th></tr>
+<tr><td>运行时机</td><td>编辑态，<code>[EditorTool]</code></td><td>Play 模式，<code>MonoBehaviour</code></td></tr>
+<tr><td>输入来源</td><td>Scene 视图事件（OnToolGUI）</td><td>Input System（InputActionReference）</td></tr>
+<tr><td>地面检测</td><td>射线 ∩ y=0 数学平面（<b>不读地形</b>）</td><td><code>Physics.Raycast</code> 打 groundMask（<b>读地形 Y</b>）</td></tr>
+<tr><td>朝向指定</td><td>支持拖拽 ≥2m 定向 + 15° 角度吸附</td><td>不支持拖拽；首点取相机前向，后续取弦向</td></tr>
+<tr><td>Undo</td><td>有（Undo.RecordObject）</td><td>无；仅有 DeleteLastSegment</td></tr>
+<tr><td>额外能力</td><td>无</td><td>Delete（删最后一段）、gridSnap</td></tr>
+</table>
+<div class="ok">关键认知：本脚本<b>同样不做几何计算</b>。它只采集输入 → 调 <code>net</code> 的图 API（<code>PlaceProfile</code>/<code>AddSegment</code>/<code>RemoveSegment</code>/<code>RemoveLooseProfile</code>）→ 用与正式落地相同的 <code>ProfileConnector.Connect</code> + <code>SegmentMeshBuilder.Build</code> 画预览。"所见即所得"的来源与编辑器工具一致。</div>
+
+<h2>1. 序列化字段（Inspector 配置）</h2>
+<table>
+<tr><th>字段</th><th>行</th><th>默认值 / 说明</th></tr>
+<tr><td><code>cam</code></td><td>22</td><td>留空 → <code>Awake</code> 取 <code>Camera.main</code></td></tr>
+<tr><td><code>buildEnabled</code></td><td>23</td><td>true；运行时总开关，<code>Update</code> 首判</td></tr>
+<tr><td><code>groundMask</code></td><td>27</td><td>地面层；未配置 → <code>Awake</code> 自动取名为 "Ground" 的层</td></tr>
+<tr><td><code>roadYOffset</code></td><td>29</td><td>0；道路 mesh 相对地面命中点的 Y 抬高，防与 ground 重叠</td></tr>
+<tr><td><code>positionActionRef</code></td><td>34</td><td>鼠标位置（Vector2），对应 IA_RoadBuilder 的 Position</td></tr>
+<tr><td><code>clickActionRef</code></td><td>36</td><td>左键确认（Button），Click</td></tr>
+<tr><td><code>cancelActionRef</code></td><td>38</td><td>取消起点，RightClick / Cancel(Esc)</td></tr>
+<tr><td><code>deleteActionRef</code></td><td>40</td><td>删除最后一段（Delete），可选</td></tr>
+<tr><td><code>looseEndSnap</code></td><td>49</td><td>3m；吸附悬空端半径，≤0 关闭</td></tr>
+<tr><td><code>gridSnap</code></td><td>50</td><td>0；位置网格吸附步长，≤0.001 关闭</td></tr>
+<tr><td><code>minSegmentLength</code></td><td>51</td><td>1m；最小路段</td></tr>
+<tr><td><code>previewLift</code></td><td>52</td><td>0.03；预览 mesh 抬高防 Z-fighting</td></tr>
+<tr><td><code>previewOkColor / previewBadColor</code></td><td>55–56</td><td>青 / 红半透明</td></tr>
+</table>
+<div class="note">第 31–46 行整段被 <code>#if ENABLE_INPUT_SYSTEM</code> 包裹——没装 Input System 包时，4 个 <code>InputActionReference</code> 字段和对应的 <code>action</code> 属性全部消失，<code>Update</code> 也静默不工作（第 110–112 行）。这是"条件编译"硬隔离，避免工程没引 Input System 时编译报错。</div>
+
+<h2>2. 生命周期入口</h2>
+<h3>Awake（68–75 行）</h3>
+<ol class="steps">
+<li><code>net = GetComponent&lt;RoadNetworkBehaviour&gt;()</code>——拿到同物体上的图宿主（<code>RequireComponent</code> 保证存在）。</li>
+<li><code>cam == null → Camera.main</code>。</li>
+<li><code>groundMask == 0 → LayerMask.GetMask("Ground")</code>：未配置时自动取 Ground 层（若该层不存在则返回 0，后续 <code>GroundPoint</code> 走 y=0 回退）。</li>
+<li><code>EnsurePreviewObjects()</code>：建好预览 GO 与材质，避免首帧延迟。</li>
+</ol>
+<h3>OnEnable（77–87 行）</h3>
+<ul>
+<li>若 <code>positionActionRef</code> 或 <code>clickActionRef</code> 为 null → <code>Debug.LogError</code> 提示去 Inspector 拖入。</li>
+<li>依次 <code>Enable()</code> 四个 action（Point/Click/Cancel/Delete）。</li>
+</ul>
+<h3>OnDisable（89–98 行）</h3>
+<p>Disable 四个 action，<code>SetPreviewVisible(false)</code> 隐藏预览。注意：<b>不清 <code>pendingStart</code></b>——禁用再启用会保留上次的待连起点（与编辑器工具 <code>OnDisable</code> 清空状态不同）。</p>
+<h3>OnDestroy（288–294 行）</h3>
+<p>销毁预览 mesh / GO / 两个材质，防运行时泄漏。</p>
+
+<h2>3. Update 主循环（100–113 行）</h2>
+<p>每帧入口，被 <code>#if ENABLE_INPUT_SYSTEM</code> 包裹。</p>
+<pre><code><span class="k">if</span> (!buildEnabled || cam == null || ClickAction == null) <span class="k">return</span>;
+<span class="k">if</span> (ClickAction.WasPressedThisFrame())  OnLeftClick();
+<span class="k">if</span> (CancelAction != null &amp;&amp; CancelAction.WasPressedThisFrame()) CancelPending();
+<span class="k">if</span> (DeleteAction != null &amp;&amp; DeleteAction.WasPressedThisFrame()) DeleteLastSegment();
+<span class="k">if</span> (pendingStart != null) UpdatePreview();</code></pre>
+<div class="note">三个要点：① 首行三重门（开关 / 相机 / Click 动作）任一不满足就整帧跳过；② 三个动作都用 <code>WasPressedThisFrame()</code>（Input System 的边沿检测），天然"每按一次触发一次"，无需手动去重；③ 只有 <code>pendingStart != null</code> 才跑预览——没有起点就不该有虚影。</div>
+
+<svg viewBox="0 0 680 250" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+  <rect x="20" y="14" width="150" height="34" rx="8" fill="#eef3fb" stroke="#1f6feb"/>
+  <text x="95" y="35" text-anchor="middle">Update 每帧</text>
+  <rect x="20" y="64" width="200" height="30" rx="6" fill="#f4f6fb" stroke="#5b6b7c"/>
+  <text x="120" y="83" text-anchor="middle">buildEnabled&amp;&amp;cam&amp;&amp;Click?</text>
+  <path d="M170 79 H230" stroke="#9aa7b8" fill="none"/>
+  <text x="200" y="73" font-size="10" fill="#c0392b">否→return</text>
+  <rect x="240" y="64" width="160" height="30" rx="6" fill="#fff" stroke="#5b6b7c"/>
+  <text x="320" y="83" text-anchor="middle">Click 按下?</text>
+  <rect x="240" y="110" width="160" height="30" rx="6" fill="#fff" stroke="#5b6b7c"/>
+  <text x="320" y="129" text-anchor="middle">Cancel 按下?</text>
+  <rect x="240" y="156" width="160" height="30" rx="6" fill="#fff" stroke="#5b6b7c"/>
+  <text x="320" y="175" text-anchor="middle">Delete 按下?</text>
+  <rect x="240" y="200" width="160" height="30" rx="6" fill="#f0faf4" stroke="#1e8e5a"/>
+  <text x="320" y="219" text-anchor="middle">pendingStart!=null?</text>
+  <g stroke="#9aa7b8" fill="none">
+    <path d="M400 79 H460"/><path d="M400 125 H460"/><path d="M400 171 H460"/><path d="M400 215 H460"/>
+  </g>
+  <g font-size="11" fill="#243b53">
+    <text x="466" y="83">OnLeftClick</text>
+    <text x="466" y="129">CancelPending</text>
+    <text x="466" y="175">DeleteLastSegment</text>
+    <text x="466" y="221">UpdatePreview</text>
+  </g>
+  <g stroke="#9aa7b8" fill="none">
+    <path d="M540 79 V221" stroke-dasharray="3 3"/>
+    <path d="M540 221 H466" stroke-dasharray="3 3"/>
+  </g>
+</svg>
+
+<h2>4. OnLeftClick：提交逻辑（117–167 行）</h2>
+<ol class="steps">
+<li><code>GroundPoint(out pos, out groundY)</code> 求地面点；失败（射线未命中且无 y=0 回退）直接 return。</li>
+<li><code>pos = SnapPos(pos)</code>；<code>roadY = groundY + roadYOffset</code>——把地形高度 + 抬高量算好，待会儿写进 <code>Profile.Y</code>。</li>
+<li><b>分支 A（pendingStart == null，放起点）</b>：
+  <ul>
+    <li><code>FindLooseEnd(pos)</code> 找 3m 内既有悬空端。</li>
+    <li>命中 → <code>pendingStart = loose</code>，<code>pendingStartIsNew = false</code>（复用，不建新 profile）。</li>
+    <li>未命中 → <code>net.PlaceProfile(pos, DefaultDirection(), DefaultLanes())</code>，并立刻 <code>pendingStart.Y = roadY</code>，<code>pendingStartIsNew = true</code>。</li>
+  </ul>
+</li>
+<li><b>分支 B（pendingStart != null，放终点并连段）</b>：
+  <ul>
+    <li>距起点 &lt; <code>minSegmentLength</code>（1m）→ return 忽略。</li>
+    <li><code>reused = loose != null &amp;&amp; loose.Id != pendingStart.Id</code>——后半句排除自环。</li>
+    <li>复用 → <code>end = loose</code>；否则 <code>dir = ComputeEndDirection(pos)</code> → <code>net.PlaceProfile(pos, dir, 克隆车道)</code> → <code>end.Y = roadY</code>。</li>
+    <li><code>seg = net.AddSegment(pendingStart, end)</code>；null → 警告并 return（<code>pendingStart</code> 不变，可原地重试）。</li>
+    <li><code>pendingStart = end</code>；<code>pendingStartIsNew = !reused</code>——<b>链式延伸</b>靠这句。</li>
+  </ul>
+</li>
+<li>末尾 <code>lastPreviewKey = null</code>：强制下一帧重建预览（因为起点/终点刚变）。</li>
+</ol>
+<div class="note">与编辑器工具的<b>核心差异</b>：运行时没有"拖拽定向"。起点朝向用 <code>DefaultDirection()</code>（相机前向投影），终点朝向用 <code>ComputeEndDirection()</code>（弦向或后方强制同向）。所以运行时画路是"自动朝向"，编辑器工具才允许手动拖出弯曲。</div>
+
+<h3>决策树</h3>
+<svg viewBox="0 0 680 300" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+  <rect x="250" y="10" width="150" height="32" rx="8" fill="#eef3fb" stroke="#1f6feb"/>
+  <text x="325" y="30" text-anchor="middle">OnLeftClick</text>
+  <rect x="250" y="58" width="160" height="28" rx="6" fill="#f4f6fb" stroke="#5b6b7c"/>
+  <text x="330" y="76" text-anchor="middle">pendingStart==null?</text>
+  <path d="M330 86 V98" stroke="#9aa7b8" fill="none"/>
+  <rect x="50" y="98" width="180" height="120" rx="8" fill="#fbfcff" stroke="#5b6b7c"/>
+  <text x="140" y="118" text-anchor="middle" font-weight="600">分支 A：放起点</text>
+  <text x="140" y="138" font-size="10.5">FindLooseEnd(3m)</text>
+  <text x="140" y="156" font-size="10.5">命中→复用(不Undo)</text>
+  <text x="140" y="174" font-size="10.5">未命中→DefaultDirection</text>
+  <text x="140" y="192" font-size="10.5">PlaceProfile + 写 Y</text>
+  <text x="140" y="210" font-size="10.5" fill="#1e8e5a">不建 segment</text>
+  <rect x="430" y="98" width="200" height="160" rx="8" fill="#fbfcff" stroke="#5b6b7c"/>
+  <text x="530" y="118" text-anchor="middle" font-weight="600">分支 B：放终点+连段</text>
+  <text x="530" y="138" font-size="10.5">距起点&lt;1m?→return</text>
+  <text x="530" y="156" font-size="10.5">FindLooseEnd(排除自身)</text>
+  <text x="530" y="174" font-size="10.5">behind?→强制同向</text>
+  <text x="530" y="192" font-size="10.5">否则→弦向(ComputeEnd)</text>
+  <text x="530" y="210" font-size="10.5">PlaceProfile + 写 Y</text>
+  <text x="530" y="228" font-size="10.5">AddSegment</text>
+  <text x="530" y="248" font-size="10.5" fill="#1e8e5a">pendingStart=end(链式)</text>
+  <path d="M250 72 H140" stroke="#9aa7b8" fill="none"/>
+  <path d="M410 72 H530" stroke="#9aa7b8" fill="none"/>
+  <path d="M140 218 V252 H325" stroke="#9aa7b8" fill="none"/>
+  <path d="M530 258 V252 H325" stroke="#9aa7b8" fill="none"/>
+  <rect x="250" y="252" width="150" height="22" rx="6" fill="#f0faf4" stroke="#1e8e5a"/>
+  <text x="325" y="267" text-anchor="middle" font-size="10.5">继续下一击</text>
+</svg>
+
+<h2>5. CancelPending / DeleteLastSegment</h2>
+<h3>CancelPending（169–177 行）</h3>
+<p>只有 <code>pendingStartIsNew</code> 才 <code>net.RemoveLooseProfile</code>（已挂节点的 profile 内部会拒绝删除）；然后清空状态、隐藏预览。<b>比编辑器工具少了 Undo</b>——运行时本就无法 Undo，Esc 只清当前待连起点。</p>
+<h3>DeleteLastSegment（180–187 行）</h3>
+<pre><code>long lastVer = long.MinValue;
+<span class="k">foreach</span> (var n <span class="k">in</span> net.Graph.Nodes.Values)
+  <span class="k">if</span> (n <span class="k">is</span> RoadSegment s &amp;&amp; n.DirtyVersion > lastVer)
+    { lastVer = n.DirtyVersion; lastId = n.Id; }
+<span class="k">if</span> (lastId != null) net.RemoveSegment(lastId);</code></pre>
+<div class="note">它用 <code>DirtyVersion</code>（每次编辑自增的版本号）挑出"版本号最大"的路段当作"最后一段"删除。这是<b>启发式</b>——<code>DirtyVersion</code> 在重建时也会被 bump，所以严格说挑的是"最近被改动过"的段，而非"时间上最后添加"的段。绝大多数情况下两者重合，但若你改过旧段又删，可能误删刚改的那条。</div>
+
+<h2>6. 朝向与默认方向</h2>
+<h3>ComputeEndDirection（190–197 行）</h3>
+<pre><code><span class="k">if</span> (Dot(endPos - startPos, startDir) &lt; 0) <span class="k">return</span> startDir;   <span class="c">// 后方半平面→强制同向</span>
+<span class="k">double</span> dist = Distance(endPos, startPos);
+<span class="k">return</span> dist > 0.1 ? (endPos - startPos).Normalized : startDir;  <span class="c">// 否则弦向</span></code></pre>
+<p>预览与提交共用此函数（第 237 行也调它），保证"虚影朝向 == 落地朝向"。</p>
+<h3>DefaultDirection（200–209 行）</h3>
+<p>首点默认朝向：取 <code>cam.transform.forward</code> 的 XZ 投影，长度 &gt;0.3 才归一化采用，否则回退 <code>DVec2.UnitY</code>（+Z）。即"朝镜头看的方向铺路"，俯视太狠（前向几乎垂直地面）时退化为 +Z。</p>
+
+<h2>7. UpdatePreview 预览管线（213–257 行）</h2>
+<ol class="steps">
+<li><code>EnsurePreviewObjects()</code>。</li>
+<li><code>GroundPoint(out endPos, out _)</code>：用<b>当前鼠标</b>求终点（<code>out _</code> 丢弃 y，因为预览高度用起点 Y）。失败 → 隐藏 return。</li>
+<li><code>endPos = SnapPos(endPos)</code>。</li>
+<li><code>dist / behind / bad = behind || dist &lt; min</code>。</li>
+<li><b>帧合并</b>（227–229）：指纹只含 <code>endPos + bad</code>（注意：<b>不含朝向</b>，因为朝向由位置唯一决定）。相同就 return。</li>
+<li><code>dist &lt; min</code> → 隐藏 return。</li>
+<li><code>endDir = ComputeEndDirection(endPos)</code>；造两个临时 profile：<code>tmpA</code>（起点，<code>tmpA.Y = pendingStart.Y</code>）与 <code>tmpB</code>（终点，<b>Y 未设，默认 0</b>）。</li>
+<li><code>ProfileConnector.Connect(tmpA, tmpB)</code> 解几何；null → 隐藏。</li>
+<li><code>SegmentMeshBuilder.Build(...)</code> 出 mesh；预览 GO 放到 <code>(X, pendingStart.Y + previewLift, Y)</code>（<b>贴起点地形高度</b>），换 mesh、按 <code>bad</code> 选红/青材质、显形、销毁旧 mesh。</li>
+</ol>
+<div class="warn">预览的朝向与编辑器工具不同：运行时<b>没有拖拽定向</b>，所以预览朝向永远走 <code>ComputeEndDirection</code>（弦向 / 后方强制同向），不会出现编辑器工具那种"拖 2m 后按 15° 吸附"的预览。这是两套工具交互语义差异的直接体现。</div>
+
+<h2>8. 预览对象与材质</h2>
+<table>
+<tr><th>函数</th><th>行</th><th>要点</th></tr>
+<tr><td><code>EnsurePreviewObjects</code></td><td>259–270</td><td>建 <code>~RoadPreview</code> GO（MeshFilter+Renderer，<code>SetActive(false)</code>）；建 ok/bad 材质（仅首次）</td></tr>
+<tr><td><code>MakePreviewMaterial</code></td><td>272–281</td><td>URP Unlit + Transparent，<code>_BaseColor</code> 取 <code>previewOkColor/previewBadColor</code></td></tr>
+<tr><td><code>SetPreviewVisible</code></td><td>283–286</td><td>比较 <code>activeSelf</code> 避免无谓 <code>SetActive</code></td></tr>
+</table>
+<div class="note">与编辑器工具不同：运行时预览 GO 是普通 <code>GameObject</code>（<b>没有</b> <code>HideFlags.HideAndDontSave</code>），因为它活在 Play 模式的场景里，随物体销毁即清理（<code>OnDestroy</code> 兜底）。编辑器工具的预览物体则标了 <code>HideAndDontSave</code> 以免污染场景。</div>
+
+<h2>9. 工具函数</h2>
+<h3>FindLooseEnd（298–310 行）</h3>
+<p><code>looseEndSnap &lt;= 0</code> 直接返回 null（关闭吸附）；否则遍历 <code>LooseEndProfiles()</code>，跳过自身，取 3m 内最近的一个。逻辑与编辑器工具一致。</p>
+<h3>SnapPos（312–317 行）</h3>
+<p><code>gridSnap &lt;= 0.001</code> → 原样返回；否则按步长 <code>Math.Round(x/s)*s</code> 取整。<b>没有 Ctrl 临时禁用</b>——运行时没有键盘事件上下文，网格吸附要么开要么关（靠 <code>gridSnap</code> 字段）。</p>
+<h3>GroundPoint（319–344 行）—— 与编辑器工具最关键的区别</h3>
+<pre><code>Ray ray = cam.ScreenPointToRay(PointAction.ReadValue&lt;Vector2&gt;());
+<span class="k">if</span> (groundMask == 0 || !Physics.Raycast(ray, out hit, 2000f, groundMask))
+{
+    <span class="c">// 未配置地面层 / 没命中 → 回退 y=0 平面</span>
+    p = (hit0.x, hit0.z); y = 0f; <span class="k">return</span> true;
+}
+p = (hit.point.x, hit.point.z); y = hit.point.y; <span class="k">return</span> true;</code></pre>
+<div class="ok">这是运行时比编辑器工具<b>强的地方</b>：用相机屏幕射线打 <code>groundMask</code> 层，命中就把地形 Y 写进 <code>Profile.Y</code>（第 135 / 154 行），正式落地的道路 mesh 因此会贴着地形高度。编辑器工具的 <code>GroundPoint</code> 只算 y=0 数学平面，永不设 Y。但当 <code>groundMask==0</code>（Ground 层不存在）或射线没命中任何地面物体时，运行时也<b>回退到 y=0 平面</b>——这点与编辑器工具行为收敛一致。</div>
+
+<svg viewBox="0 0 680 230" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">
+  <rect x="280" y="12" width="120" height="32" rx="8" fill="#eef3fb" stroke="#1f6feb"/>
+  <text x="340" y="32" text-anchor="middle">GroundPoint</text>
+  <rect x="280" y="60" width="170" height="30" rx="6" fill="#f4f6fb" stroke="#5b6b7c"/>
+  <text x="365" y="79" text-anchor="middle">Raycast groundMask?</text>
+  <rect x="40" y="110" width="200" height="70" rx="8" fill="#fbfcff" stroke="#1e8e5a"/>
+  <text x="140" y="132" text-anchor="middle" font-weight="600">命中地面</text>
+  <text x="140" y="152" font-size="10.5">p = hit.point.xz</text>
+  <text x="140" y="170" font-size="10.5">y = hit.point.y (地形高)</text>
+  <rect x="430" y="110" width="200" height="70" rx="8" fill="#fbfcff" stroke="#c0392b"/>
+  <text x="530" y="132" text-anchor="middle" font-weight="600">未命中/无层</text>
+  <text x="530" y="152" font-size="10.5">p = 与 y=0 平面交点</text>
+  <text x="530" y="170" font-size="10.5">y = 0 (回退)</text>
+  <g stroke="#9aa7b8" fill="none"><path d="M365 90 V110"/><path d="M365 90 V110"/></g>
+  <path d="M280 75 H140" stroke="#9aa7b8" fill="none"/>
+  <path d="M450 75 H530" stroke="#9aa7b8" fill="none"/>
+  <text x="200" y="100" font-size="10" fill="#1e8e5a">是</text>
+  <text x="450" y="100" font-size="10" fill="#c0392b">否/无层</text>
+  <rect x="200" y="200" width="280" height="22" rx="6" fill="#f0faf4" stroke="#1e8e5a"/>
+  <text x="340" y="215" text-anchor="middle" font-size="10.5">roadY = y + roadYOffset → 写 Profile.Y</text>
+  <path d="M140 180 V200 H340" stroke="#9aa7b8" fill="none"/>
+  <path d="M530 180 V200 H340" stroke="#9aa7b8" fill="none"/>
+</svg>
+
+<h2>10. 端到端串一遍</h2>
+<ol class="steps">
+<li>物体激活 → <code>Awake</code> 取 net/cam/groundMask，建预览对象 → <code>OnEnable</code> 启用 4 个 Input Action。</li>
+<li>每帧 <code>Update</code>：点左键 → <code>OnLeftClick</code>：<code>GroundPoint</code> 打地形拿 Y → 分支 A 落悬空 profile（写 Y）；移动鼠标 → <code>UpdatePreview</code> 每帧用同套几何/网格画青色虚影，高度贴起点 Y。</li>
+<li>再点左键 → 分支 B：<code>ComputeEndDirection</code> 定朝向 → <code>PlaceProfile</code>（写 Y）→ <code>AddSegment</code> → <code>pendingStart</code> 前移成新端点，可无限续接。</li>
+<li><code>AddSegment</code> 触发 <code>RoadGraph.Changed</code> → <code>RoadNetworkBehaviour.Update</code> 检测 JSON 变化 → <code>ProfileConnector</code> 解几何 → <code>PathSampler</code> 采样 → <code>SegmentMeshBuilder</code> 出正式 mesh（用两端 Profile.Y，贴地形）→ 挂到 <code>DontSave</code> 子物体。</li>
+<li>右键/Esc → <code>CancelPending</code> 清待连起点；Delete → <code>DeleteLastSegment</code> 删最近段。</li>
+</ol>
+
+<h2>11. 值得注意的问题</h2>
+<div class="warn"><b>1. 预览的终点 Y 缺失（坡度上预览错位）。</b>第 240 行 <code>var tmpB = Profile.Create(endPos, endDir, pendingStart.Lanes);</code> 之后<b>没有设 <code>tmpB.Y</code></b>（起点 <code>tmpA.Y</code> 在第 239 行设了）。而 <code>ProfileConnector</code> 用两端 Y 决定路径高度，所以预览整条按 <code>pendingStart.Y</code> 拉平。地形有坡度时，虚影是平的、落地后是斜的，二者不一致。修法：第 240 行后加 <code>tmpB.Y = roadY;</code>（需让 <code>UpdatePreview</code> 也拿到 <code>groundY</code>，目前 <code>out _</code> 丢弃了）。</div>
+<div class="warn"><b>2. 无拖拽定向，弯道只能靠"分段弦向"近似。</b>运行时每点一个位置，朝向取弦向或后方强制同向，无法像编辑器那样拖出平滑大弧。连续点击密铺可近似曲线，但单段曲率受几何内核的 fillet 限制。若想要运行时也支持拖拽定向，需要额外记录按下点并加 <code>DragDirThreshold</code> 判定（编辑器工具已有现成实现可移植）。</div>
+<div class="note"><b>3. DeleteLastSegment 是启发式，非严格栈。</b>依赖 <code>DirtyVersion</code> 最大者，改过旧段后删可能误删。若要严格"撤销最后添加"，应维护一个内部 <code>List&lt;string&gt;</code> 记录添加顺序，Delete 弹栈。当前实现在"只加不改"的工作流下正确。</div>
+<div class="ok"><b>4. 比编辑器工具正确的地方：读地形 Y。</b>运行时 <code>GroundPoint</code> 走 <code>Physics.Raycast</code> 并把命中 Y 写进 <code>Profile.Y</code>，正式道路 mesh 贴合地形；编辑器工具永远 y=0。若同一套路网在编辑器里画、运行时显示，Y 会不一致（编辑器画的段 Y=0，运行时画的段有地形高）。</div>
+
+<p style="margin-top:24px;color:var(--muted);font-size:12px">本文档基于 Assets/RoadSystem/Runtime/RoadPlayerBuilder.cs 实测代码（346 行）逐行分析，行号对应原文件。</p>
+</main>
+</body>
+</html>
