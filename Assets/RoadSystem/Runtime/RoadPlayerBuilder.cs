@@ -9,10 +9,14 @@ using UnityEngine.InputSystem;
 namespace RoadSystem
 {
     /// <summary>
-    /// 运行时画路（Play 模式，Input System 输入）：
-    ///  左键单击放置起点 → 移动鼠标实时半透明预览 → 再次左键确认建设，并自动连续延伸；
-    ///  右键 / Esc 取消当前起点；
-    ///  自动吸附既有悬空端（looseEndSnap 米），落在源后方半平面时强制同向（红色警示预览）。
+    /// 运行时画路（Play 模式，Input System 输入），三击建造一条完整弯路（直路 + 圆弧 + 直路）：
+    ///  ① 左键落起点 → 移动鼠标实时半透明预览首段直路；
+    ///  ② 左键创建首段直路 → pendingStart 移到直路末尾，移动鼠标预览下半段弯路（圆弧 + 后半段直路）；
+    ///  ③ 左键创建弯路段，整条道路完成并复位；下一条路的第一击不吸附上一条弯路末尾。
+    ///  右键 / Esc 取消当前未完成道路；
+    ///  自动吸附既有悬空端（looseEndSnap 米）。半平面规则：直路阶段若起点为本工具新建，
+    ///  允许在起点后方画直路（起点朝向自动转到鼠标方向）；吸附的既有端点与弯路阶段落在后方时
+    ///  会被阻止（无法求解路径，预览红色/隐藏）。
     /// 挂在 RoadNetworkBehaviour 同一物体上即可；buildEnabled 可运行时开关。
     /// </summary>
     [RequireComponent(typeof(RoadNetworkBehaviour))]
@@ -81,10 +85,17 @@ namespace RoadSystem
 
         /// <summary>同物体上的图宿主引用；所有图操作（PlaceProfile / AddSegment / Remove...）都通过它完成。</summary>
         RoadNetworkBehaviour net;
-        /// <summary>当前待连接的起点 profile（已入图）；为 null 表示尚未开始画路。</summary>
-        Profile pendingStart;
+        /// <summary>当前待连起点 profile 的 Id（跨帧只存 Id 不存引用：宿主 RebuildAll 会用 JSON 整图替换对象，引用会失效）；null 表示尚未开始画路。</summary>
+        string pendingStartId;
         /// <summary>标记起点是否由本工具新建；决定 CancelPending 时能否删除该 loose profile。</summary>
         bool pendingStartIsNew;
+        /// <summary>弯路阶段标记：pendingStart 为首段直路末尾，下一次左键（第三击）将创建弯路段。</summary>
+        bool buildingCurve;
+        /// <summary>上一条已完成道路末尾 profile 的 Id；仅在下一条路的第一击吸附中被排除，避免新道路误接旧弯路末尾。</summary>
+        string lastRoadEndId;
+
+        /// <summary>从活图解析当前起点 profile；Id 为空或已被删除时返回 null。</summary>
+        Profile PendingStart => pendingStartId != null ? net.Graph.GetProfile(pendingStartId) : null;
 
         /// <summary>预览路面物体的根 GameObject，挂载 MeshFilter / MeshRenderer。</summary>
         GameObject previewGo;
@@ -144,7 +155,7 @@ namespace RoadSystem
             if (CancelAction != null && CancelAction.WasPressedThisFrame()) CancelPending();
             if (DeleteAction != null && DeleteAction.WasPressedThisFrame()) DeleteLastSegment();
 
-            if (pendingStart != null) UpdatePreview();
+            if (pendingStartId != null) UpdatePreview();
 #else
             // 未启用 Input System 时静默不工作（Project Settings → Active Input Handler）
 #endif
@@ -152,66 +163,126 @@ namespace RoadSystem
 
         // ---------------- 交互 ----------------
 
-        /// <summary>左键放置逻辑：首击落起点 profile，再次点击连段并链式延伸；两端均写入地形高度 Y。</summary>
+        /// <summary>左键放置逻辑（三击建造一条完整弯路）：
+        /// ① 落起点 profile（优先吸附既有悬空端，排除上一条路末尾）；
+        /// ② 从起点建首段直路，pendingStart 移到直路末尾，进入弯路预览阶段；
+        /// ③ 从直路末尾建弯路段（圆弧+后半段直路），整条道路完成并复位状态。
+        /// 两端均写入地形高度 Y。</summary>
         void OnLeftClick()
         {
             if (!GroundPoint(out DVec2 pos, out float groundY)) return;
             pos = SnapPos(pos);
             float roadY = groundY + roadYOffset;
 
-            if (pendingStart == null)
+            var start = PendingStart;
+            if (start == null)
             {
-                // 起点：优先吸附既有悬空端
+                // 第一击：起点优先吸附既有悬空端（lastRoadEnd 已在下条路开始前排除）
+                pendingStartId = null;
                 var loose = FindLooseEnd(pos);
                 if (loose != null)
                 {
-                    pendingStart = loose;
+                    pendingStartId = loose.Id;
                     pendingStartIsNew = false;
                 }
                 else
                 {
-                    pendingStart = net.PlaceProfile(pos, DefaultDirection(), Profile.DefaultLanes());
-                    pendingStart.Y = roadY;
+                    // y 在 PlaceProfile 内部序列化前写入，保证进入 JSON 快照（否则 RebuildAll 会把 Y 还原成 0）
+                    var p = net.PlaceProfile(pos, DefaultDirection(), Profile.DefaultLanes(), roadY);
+                    pendingStartId = p.Id;
                     pendingStartIsNew = true;
                 }
+                buildingCurve = false;
+                lastRoadEndId = null; // 新路已开始，恢复对旧端点的正常吸附
             }
             else
             {
-                if (DVec2.Distance(pos, pendingStart.Position) < minSegmentLength) return;
-
-                var loose = FindLooseEnd(pos);
-                bool reused = loose != null && loose.Id != pendingStart.Id;
-                Profile end;
-                if (reused)
+                // 第二击（首段直路）或第三击（弯路段）：从 start 建到当前点击处
+                // 直路允许落在起点后方半平面：起点为本工具新建（未接任何路段）时，
+                // 先把起点朝向转到弦向（与预览一致），路段即成纯直路；
+                // 吸附的既有端点仍禁止后方创建（会与既有路段折返/重叠）
+                if (!buildingCurve && pendingStartIsNew &&
+                    DVec2.Distance(pos, start.Position) >= minSegmentLength &&
+                    DVec2.Dot(pos - start.Position, start.Direction) < 0)
                 {
-                    end = loose;
+                    net.MoveProfile(start, start.Position, (pos - start.Position).Normalized);
+                }
+
+                if (!TryBuildSegment(start, pos, roadY, out Profile end, out bool reused))
+                    return;
+
+                if (buildingCurve)
+                {
+                    // 第三击：弯路段创建完成 → 整条道路结束，复位状态；
+                    // 记住末尾，下一条路的第一击不吸附它
+                    lastRoadEndId = end.Id;
+                    pendingStartId = null;
+                    pendingStartIsNew = false;
+                    buildingCurve = false;
+                    SetPreviewVisible(false);
                 }
                 else
                 {
-                    DVec2 dir = ComputeEndDirection(pos);
-                    end = net.PlaceProfile(pos, dir, (LaneDef[])pendingStart.Lanes.Clone());
-                    end.Y = roadY;
+                    // 第二击：首段直路已创建 → pendingStart 移到直路末尾，进入弯路阶段
+                    pendingStartId = end.Id;
+                    pendingStartIsNew = !reused;
+                    buildingCurve = true;
                 }
-
-                var seg = net.AddSegment(pendingStart, end);
-                if (seg == null)
-                {
-                    Debug.LogWarning("[RoadSystem] 路段创建失败");
-                    return;
-                }
-                pendingStart = end;
-                pendingStartIsNew = !reused;
             }
             lastPreviewKey = null;
         }
 
-        /// <summary>取消当前待连起点：若起点为本工具新建则移除其 loose profile，并清空状态、隐藏预览。</summary>
+        /// <summary>从起点到点击处建一段路（直路段与弯路段共用）：
+        /// 距离过短返回 false；否则按吸附/新建放置终点 profile 并 AddSegment。</summary>
+        bool TryBuildSegment(Profile start, DVec2 pos, float roadY, out Profile end, out bool reused)
+        {
+            end = null;
+            reused = false;
+            if (DVec2.Distance(pos, start.Position) < minSegmentLength) return false;
+
+            var loose = FindLooseEnd(pos);
+            reused = loose != null && loose.Id != start.Id;
+            if (reused)
+            {
+                end = loose;
+            }
+            else
+            {
+                // 弯路阶段：终点朝向按 1.5φ 规则，保证 Fillet 能解出 圆弧+后半段直路
+                DVec2 dir = buildingCurve
+                    ? ComputeCurveEndDirection(start, pos)
+                    : ComputeEndDirection(start, pos);
+                // y 随 PlaceProfile 一起提交（随后 AddSegment 会再次序列化，Y 不会丢）
+                end = net.PlaceProfile(pos, dir, (LaneDef[])start.Lanes.Clone(), roadY);
+            }
+
+            // 提交前预检：几何解不出路径的位置直接拒绝，避免创建无网格的隐形路段
+            var tmpA = Profile.Create(start.Position, start.Direction, start.Lanes);
+            var tmpB = Profile.Create(end.Position, end.Direction, end.Lanes);
+            if (ProfileConnector.Connect(tmpA, tmpB) == null)
+            {
+                Debug.LogWarning("[RoadSystem] 该位置无法求解路径，路段未创建（可尝试换个方向/位置）");
+                if (!reused) net.RemoveLooseProfile(end); // 回滚刚新建的终点
+                return false;
+            }
+
+            if (net.AddSegment(start, end) == null)
+            {
+                Debug.LogWarning("[RoadSystem] 路段创建失败");
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>取消当前未完成道路：若起点为本工具新建则移除其 loose profile，并清空状态、隐藏预览。</summary>
         void CancelPending()
         {
-            if (pendingStart != null && pendingStartIsNew)
-                net.RemoveLooseProfile(pendingStart); // 仅从未接入任何段时生效
-            pendingStart = null;
+            var start = PendingStart;
+            if (start != null && pendingStartIsNew)
+                net.RemoveLooseProfile(start); // 仅从未接入任何段时生效
+            pendingStartId = null;
             pendingStartIsNew = false;
+            buildingCurve = false;
             SetPreviewVisible(false);
             lastPreviewKey = null;
         }
@@ -226,14 +297,31 @@ namespace RoadSystem
             if (lastId != null) net.RemoveSegment(lastId);
         }
 
-        /// <summary>预览/提交共用的终点朝向规则：后方半平面强制同向，否则取弦向。</summary>
-        DVec2 ComputeEndDirection(DVec2 endPos)
+        /// <summary>预览/提交共用的终点朝向规则（直路段）：后方半平面强制同向，否则取弦向。</summary>
+        DVec2 ComputeEndDirection(Profile start, DVec2 endPos)
         {
-            if (DVec2.Dot(endPos - pendingStart.Position, pendingStart.Direction) < 0)
-                return pendingStart.Direction; // 半平面约束
-            double dist = DVec2.Distance(endPos, pendingStart.Position);
-            return dist > 0.1 ? (endPos - pendingStart.Position).Normalized
-                              : pendingStart.Direction;
+            if (DVec2.Dot(endPos - start.Position, start.Direction) < 0)
+                return start.Direction; // 半平面约束
+            double dist = DVec2.Distance(endPos, start.Position);
+            return dist > 0.1 ? (endPos - start.Position).Normalized
+                              : start.Direction;
+        }
+
+        /// <summary>弯路段（第三击）终点朝向：从起点朝向按弦向转角 φ 的 1.5 倍有符号旋转。
+        /// 不能用弦向：弦向延续线恰好穿过起点，Fillet 交点与起点重合（cA=0）退化为纯直线；
+        /// 圆弧(起点切向固定)+后半段直路 的可解范围是 ψ 在 φ 和 2φ 之间（含 2φ），取中值 1.5φ 两侧留等量余量。</summary>
+        DVec2 ComputeCurveEndDirection(Profile start, DVec2 endPos)
+        {
+            DVec2 dA = start.Direction;
+            DVec2 w = endPos - start.Position;
+            if (w.Length < 0.1 || DVec2.Dot(w, dA) < 0)
+                return dA; // 过近或后方半平面：同向兜底（红色警示）
+
+            DVec2 chord = w.Normalized;
+            double phi = System.Math.Atan2(DVec2.Cross(dA, chord), DVec2.Dot(dA, chord));
+            double psi = phi * 1.5;
+            double c = System.Math.Cos(psi), s = System.Math.Sin(psi);
+            return new DVec2(dA.X * c - dA.Y * s, dA.X * s + dA.Y * c);
         }
 
         /// <summary>首点默认朝向：相机前向在 XZ 的投影，过于俯视时取 +Z。</summary>
@@ -254,6 +342,12 @@ namespace RoadSystem
         void UpdatePreview()
         {
             EnsurePreviewObjects();
+            var start = PendingStart;
+            if (start == null)
+            {
+                SetPreviewVisible(false);
+                return;
+            }
             if (!GroundPoint(out DVec2 endPos, out _))
             {
                 SetPreviewVisible(false);
@@ -261,9 +355,13 @@ namespace RoadSystem
             }
             endPos = SnapPos(endPos);
 
-            double dist = DVec2.Distance(endPos, pendingStart.Position);
-            bool behind = DVec2.Dot(endPos - pendingStart.Position, pendingStart.Direction) < 0;
-            bool bad = behind || dist < minSegmentLength;
+            double dist = DVec2.Distance(endPos, start.Position);
+            bool behind = DVec2.Dot(endPos - start.Position, start.Direction) < 0;
+
+            // 直路阶段且起点为本工具新建（未接任何路段）：允许在起点后方画直路
+            // —— 与提交一致：等效于把起点朝向转到弦向，两端口同向即成纯直路
+            bool straightBehindOk = !buildingCurve && pendingStartIsNew && behind;
+            bool bad = (behind && !straightBehindOk) || dist < minSegmentLength;
 
             string key = $"{endPos.X:F2},{endPos.Y:F2},{bad}";
             if (key == lastPreviewKey) return; // 帧合并：位置未变不重建
@@ -275,10 +373,14 @@ namespace RoadSystem
                 return;
             }
 
-            DVec2 endDir = ComputeEndDirection(endPos);
-            var tmpA = Profile.Create(pendingStart.Position, pendingStart.Direction, pendingStart.Lanes);
-            tmpA.Y = pendingStart.Y;
-            var tmpB = Profile.Create(endPos, endDir, pendingStart.Lanes);
+            DVec2 chordDir = (endPos - start.Position).Normalized;
+            DVec2 startDir = straightBehindOk ? chordDir : start.Direction;
+            DVec2 endDir = straightBehindOk ? chordDir
+                : buildingCurve ? ComputeCurveEndDirection(start, endPos)
+                : ComputeEndDirection(start, endPos);
+            var tmpA = Profile.Create(start.Position, startDir, start.Lanes);
+            tmpA.Y = start.Y;
+            var tmpB = Profile.Create(endPos, endDir, start.Lanes);
             var path = ProfileConnector.Connect(tmpA, tmpB);
             if (path == null)
             {
@@ -286,10 +388,10 @@ namespace RoadSystem
                 return;
             }
 
-            var mesh = SegmentMeshBuilder.Build(path, pendingStart.Lanes, pendingStart.Position, 0.05f, 6f);
+            var mesh = SegmentMeshBuilder.Build(path, start.Lanes, start.Position, 0.05f, 6f);
             // 预览抬到起点 Y 之上一点，防 Z-fighting
             previewGo.transform.position = new Vector3(
-                (float)pendingStart.Position.X, pendingStart.Y + previewLift, (float)pendingStart.Position.Y);
+                (float)start.Position.X, start.Y + previewLift, (float)start.Position.Y);
             var old = previewMf.sharedMesh;
             previewMf.sharedMesh = mesh;
             previewMr.sharedMaterial = bad ? matBad : matOk;
@@ -340,7 +442,7 @@ namespace RoadSystem
 
         // ---------------- 工具 ----------------
 
-        /// <summary>在吸附半径内查找最近的既有悬空端（排除当前起点自身），用于续接/复用。</summary>
+        /// <summary>在吸附半径内查找最近的既有悬空端（排除当前起点自身与上一条路末尾），用于续接/复用。</summary>
         Profile FindLooseEnd(DVec2 pos)
         {
             if (looseEndSnap <= 0) return null;
@@ -348,7 +450,8 @@ namespace RoadSystem
             double bestD = looseEndSnap;
             foreach (var p in net.Graph.LooseEndProfiles())
             {
-                if (pendingStart != null && p.Id == pendingStart.Id) continue;
+                if (pendingStartId != null && p.Id == pendingStartId) continue;
+                if (lastRoadEndId != null && p.Id == lastRoadEndId) continue; // 上一条路末尾：下一条路不误接
                 double d = DVec2.Distance(p.Position, pos);
                 if (d < bestD) { bestD = d; best = p; }
             }

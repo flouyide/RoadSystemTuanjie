@@ -56,11 +56,12 @@ namespace RoadSystem
 
         // ---------------- 编辑 API（编辑器层调用；调用前须 Undo.RecordObject） ----------------
 
-        /// <summary>编辑 API：在图里新建一个端点 Profile（悬空端），写存档并返回该 profile。</summary>
-        public Profile PlaceProfile(DVec2 pos, DVec2 dir, LaneDef[] lanes = null)
+        /// <summary>编辑 API：在图里新建一个端点 Profile（悬空端），y 须随本调用写入（内部会立即序列化存档，事后再改 Y 会被下次整图重建还原成旧值），写存档并返回该 profile。</summary>
+        public Profile PlaceProfile(DVec2 pos, DVec2 dir, LaneDef[] lanes = null, float y = 0f)
         {
             EnsureGraph();
             var p = Graph.CreateProfile(pos, dir, lanes);
+            p.Y = y;
             CommitEdit();
             return p;
         }

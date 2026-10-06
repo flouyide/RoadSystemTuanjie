@@ -104,7 +104,7 @@ namespace RoadSystem.Core
         }
 
         // ---------------- 内部 ----------------
-
+        // 把 segment 的 Id 写进 profile 的 NodeAId/NodeBId 槽位
         void Attach(Profile p, string nodeId)
         {
             if (string.IsNullOrEmpty(p.NodeAId)) p.NodeAId = nodeId;
@@ -145,6 +145,8 @@ namespace RoadSystem.Core
             return set;
         }
 
+        //把该 segment 节点的 DirtyVersion++
+        //触发 Changed 事件，把 [seg.Id] 传给订阅者(宿主的 OnGraphChanged)
         void NotifyAffected(IReadOnlyList<string> ids)
         {
             if (ids == null || ids.Count == 0) return;
