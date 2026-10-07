@@ -4,7 +4,8 @@
     "references": [
         "RoadSystem.Core",
         "RoadSystem.Geometry",
-        "Unity.InputSystem"
+        "Unity.InputSystem",
+        "UnityEngine.UI"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],

@@ -38,6 +38,8 @@ namespace RoadSystem.Core
         public string Kind; // "segment" | "intersection"
         /// <summary>端口（Profile）Id 列表：路段为 2 个，路口为 N（N>=3）个。</summary>
         public List<string> PortIds = new List<string>();
+        /// <summary>所属道路分组 Id（仅 segment 使用；一次建造流程的若干路段共享同一 Id）。</summary>
+        public string RoadId;
         /// <summary>显式车道级转向连接（仅 intersection 使用；路段为空）。</summary>
         public List<LaneConnection> LaneLinks = new List<LaneConnection>(); // 仅 intersection
     }
@@ -85,7 +87,11 @@ namespace RoadSystem.Core
                     nd.Kind = "intersection";
                     nd.LaneLinks = new List<LaneConnection>(ix.LaneLinks);
                 }
-                else nd.Kind = "segment";
+                else
+                {
+                    nd.Kind = "segment";
+                    nd.RoadId = ((RoadSegment)n).RoadId;
+                }
                 dto.Nodes.Add(nd);
             }
             return dto;
@@ -116,9 +122,16 @@ namespace RoadSystem.Core
             }
             foreach (var nd in dto.Nodes)
             {
-                RoadNodeBase n = nd.Kind == "intersection"
-                    ? (RoadNodeBase)new Intersection { LaneLinks = nd.LaneLinks ?? new List<LaneConnection>() }
-                    : new RoadSegment();
+                RoadNodeBase n;
+                if (nd.Kind == "intersection")
+                {
+                    n = new Intersection { LaneLinks = nd.LaneLinks ?? new List<LaneConnection>() };
+                }
+                else
+                {
+                    var seg = new RoadSegment { RoadId = nd.RoadId };
+                    n = seg;
+                }
                 n.Id = nd.Id;
                 n.PortIds = nd.PortIds ?? new List<string>();
                 g.Nodes[n.Id] = n;

@@ -2,21 +2,34 @@ using RoadSystem.Core;
 using RoadSystem.Geometry;
 using RoadSystem.Meshing;
 using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.UI;
 #if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 #endif
 
 namespace RoadSystem
 {
+    /// <summary>建造模式：直路（两击一条）或 弯路（三击一条：直路+圆弧+直路）。</summary>
+    public enum RoadBuildMode
+    {
+        /// <summary>直路：第一击落起点，第二击落终点即完成一条直路。</summary>
+        Straight,
+        /// <summary>弯路：第一击落起点，第二击建首段直路，第三击建弯路段（圆弧+后半段直路）。</summary>
+        Curve
+    }
+
     /// <summary>
-    /// 运行时画路（Play 模式，Input System 输入），三击建造一条完整弯路（直路 + 圆弧 + 直路）：
-    ///  ① 左键落起点 → 移动鼠标实时半透明预览首段直路；
-    ///  ② 左键创建首段直路 → pendingStart 移到直路末尾，移动鼠标预览下半段弯路（圆弧 + 后半段直路）；
-    ///  ③ 左键创建弯路段，整条道路完成并复位；下一条路的第一击不吸附上一条弯路末尾。
+    /// 运行时画路（Play 模式，Input System 输入），支持两种建造模式（可用 UI 按钮切换，默认直路）：
+    ///  直路模式（两击）：① 左键落起点 → 移动鼠标实时预览 → ② 左键落终点，一条直路完成；
+    ///  弯路模式（三击）：① 左键落起点 → ② 建首段直路 → ③ 建弯路段（圆弧 + 后半段直路），整条道路完成；
+    ///  场景中名为 "Straight" / "Curve" 的 UI 按钮会在 Awake 时自动挂接模式切换（也可用 Inspector 的 buildMode 预设）；
+    ///  右键 / Esc 取消当前未完成道路；切换模式同样会取消未完成道路。
     ///  右键 / Esc 取消当前未完成道路；
     ///  自动吸附既有悬空端（looseEndSnap 米）。半平面规则：直路阶段若起点为本工具新建，
     ///  允许在起点后方画直路（起点朝向自动转到鼠标方向）；吸附的既有端点与弯路阶段落在后方时
-    ///  会被阻止（无法求解路径，预览红色/隐藏）。
+    ///  会被阻止。不可建造的状态一律显示红色虚影（几何无解时为起点到鼠标的红色直线提示）。
+    ///  每条道路（三击建成的一组路段）共享一个道路分组 Id，场景中归到各自 road_xxxxxx 子 GameObject 下。
     /// 挂在 RoadNetworkBehaviour 同一物体上即可；buildEnabled 可运行时开关。
     /// </summary>
     [RequireComponent(typeof(RoadNetworkBehaviour))]
@@ -66,6 +79,8 @@ namespace RoadSystem
 #endif
 
         [Header("建造参数")]
+        /// <summary>当前建造模式：直路（两击一条）或弯路（三击一条）；UI 按钮 / 代码可随时切换。</summary>
+        [SerializeField] RoadBuildMode buildMode = RoadBuildMode.Straight;
         /// <summary>吸附既有悬空端 profile 的半径（米）；≤0 时关闭吸附。</summary>
         [SerializeField, Tooltip("吸附既有悬空端的半径（米），0 关闭")] float looseEndSnap = 3f;
         /// <summary>位置网格吸附步长（米）；≤0.001 视为关闭。运行时无键盘事件，故无 Ctrl 临时禁用。</summary>
@@ -93,9 +108,55 @@ namespace RoadSystem
         bool buildingCurve;
         /// <summary>上一条已完成道路末尾 profile 的 Id；仅在下一条路的第一击吸附中被排除，避免新道路误接旧弯路末尾。</summary>
         string lastRoadEndId;
+        /// <summary>当前正在建造的道路分组 Id：第一击建段时生成，同一条道路（第二击直路 + 第三击弯路）的路段共享；
+        /// 道路完成 / 取消 / 新道路开始时清空。运行时渲染据此把每条道路归到各自的 GameObject 下。</summary>
+        string currentRoadId;
 
         /// <summary>从活图解析当前起点 profile；Id 为空或已被删除时返回 null。</summary>
         Profile PendingStart => pendingStartId != null ? net.Graph.GetProfile(pendingStartId) : null;
+
+        // ---------------- 建造模式 ----------------
+
+        /// <summary>当前建造模式（只读）。</summary>
+        public RoadBuildMode BuildMode => buildMode;
+
+        /// <summary>切换建造模式；若正有未完成道路则取消之，避免两种模式的段混在同一条路里。</summary>
+        public void SetBuildMode(RoadBuildMode mode)
+        {
+            if (buildMode == mode) return;
+            buildMode = mode;
+            if (Application.isPlaying) CancelPending();
+            Debug.Log($"[RoadSystem] 建造模式切换为：{(mode == RoadBuildMode.Straight ? "直路（两击）" : "弯路（三击）")}");
+        }
+
+        /// <summary>UI 按钮 "Straight" 的回调：切换到直路模式。</summary>
+        public void SetStraightMode() => SetBuildMode(RoadBuildMode.Straight);
+
+        /// <summary>UI 按钮 "Curve" 的回调：切换到弯路模式。</summary>
+        public void SetCurveMode() => SetBuildMode(RoadBuildMode.Curve);
+
+        /// <summary>Awake 时按名称兜底挂接模式切换按钮（"Straight" / "Curve"）：
+        /// 仅当按钮尚未在 Inspector 里手动绑定回调（persistentEventCount == 0）时才补挂，
+        /// 已手动配置的按钮以场景设置为准，不做重复挂接。</summary>
+        void WireModeButtons()
+        {
+            HookModeButton("Straight", SetStraightMode);
+            HookModeButton("Curve", SetCurveMode);
+        }
+
+        /// <summary>按 GameObject 名称查找 UI Button；若没有任何手动绑定的回调则自动补挂，否则跳过。</summary>
+        static void HookModeButton(string buttonName, UnityEngine.Events.UnityAction action)
+        {
+            var go = GameObject.Find(buttonName);
+            var btn = go != null ? go.GetComponent<Button>() : null;
+            if (btn == null)
+            {
+                Debug.LogWarning($"[RoadSystem] 未找到名为 {buttonName} 的 UI 按钮，无法兜底挂接建造模式切换");
+                return;
+            }
+            if (btn.onClick.GetPersistentEventCount() > 0) return; // 已手动配置：以场景为准
+            btn.onClick.AddListener(action);
+        }
 
         /// <summary>预览路面物体的根 GameObject，挂载 MeshFilter / MeshRenderer。</summary>
         GameObject previewGo;
@@ -118,6 +179,7 @@ namespace RoadSystem
             if (groundMask == 0)
                 groundMask = LayerMask.GetMask("Ground"); // 未配置时自动取 Ground 层
             EnsurePreviewObjects();
+            WireModeButtons();
         }
 
         /// <summary>启用时开启所有 Input Action；若缺少必需的 Position / Click 引用则报错提示。</summary>
@@ -151,9 +213,12 @@ namespace RoadSystem
 #if ENABLE_INPUT_SYSTEM
             if (!buildEnabled || cam == null || ClickAction == null) return;
 
-            if (ClickAction.WasPressedThisFrame()) OnLeftClick();
-            if (CancelAction != null && CancelAction.WasPressedThisFrame()) CancelPending();
-            if (DeleteAction != null && DeleteAction.WasPressedThisFrame()) DeleteLastSegment();
+            // 鼠标悬停在 UI（如模式按钮）上时忽略本次点击，避免点按钮的同时误落路点
+            bool overUi = EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
+
+            if (!overUi && ClickAction.WasPressedThisFrame()) OnLeftClick();
+            if (!overUi && CancelAction != null && CancelAction.WasPressedThisFrame()) CancelPending();
+            if (!overUi && DeleteAction != null && DeleteAction.WasPressedThisFrame()) DeleteLastSegment();
 
             if (pendingStartId != null) UpdatePreview();
 #else
@@ -163,11 +228,10 @@ namespace RoadSystem
 
         // ---------------- 交互 ----------------
 
-        /// <summary>左键放置逻辑（三击建造一条完整弯路）：
-        /// ① 落起点 profile（优先吸附既有悬空端，排除上一条路末尾）；
-        /// ② 从起点建首段直路，pendingStart 移到直路末尾，进入弯路预览阶段；
-        /// ③ 从直路末尾建弯路段（圆弧+后半段直路），整条道路完成并复位状态。
-        /// 两端均写入地形高度 Y。</summary>
+        /// <summary>左键放置逻辑（按模式分派）：
+        /// 直路模式两击：① 落起点 profile（优先吸附既有悬空端）→ ② 建直路并完成整条道路；
+        /// 弯路模式三击：① 落起点 → ② 建首段直路，pendingStart 移到直路末尾 → ③ 建弯路段并完成。
+        /// 两端均写入地形高度 Y；直路阶段若起点为本工具新建且点击在后方，先转起点朝向（允许向后半平面画直路）。</summary>
         void OnLeftClick()
         {
             if (!GroundPoint(out DVec2 pos, out float groundY)) return;
@@ -194,6 +258,7 @@ namespace RoadSystem
                 }
                 buildingCurve = false;
                 lastRoadEndId = null; // 新路已开始，恢复对旧端点的正常吸附
+                currentRoadId = null; // 新道路开始：清空上一条的分组 Id
             }
             else
             {
@@ -211,15 +276,10 @@ namespace RoadSystem
                 if (!TryBuildSegment(start, pos, roadY, out Profile end, out bool reused))
                     return;
 
-                if (buildingCurve)
+                if (buildingCurve || buildMode == RoadBuildMode.Straight)
                 {
-                    // 第三击：弯路段创建完成 → 整条道路结束，复位状态；
-                    // 记住末尾，下一条路的第一击不吸附它
-                    lastRoadEndId = end.Id;
-                    pendingStartId = null;
-                    pendingStartIsNew = false;
-                    buildingCurve = false;
-                    SetPreviewVisible(false);
+                    // 第三击（弯路模式的弯路段）或第二击（直路模式的终点）：整条道路完成
+                    CompleteRoad(end);
                 }
                 else
                 {
@@ -230,6 +290,18 @@ namespace RoadSystem
                 }
             }
             lastPreviewKey = null;
+        }
+
+        /// <summary>整条道路建造完成：复位全部状态并隐藏预览；
+        /// 记住末尾 Id 使下一条路的第一击不吸附本条路的末尾。</summary>
+        void CompleteRoad(Profile end)
+        {
+            lastRoadEndId = end.Id;
+            pendingStartId = null;
+            pendingStartIsNew = false;
+            buildingCurve = false;
+            currentRoadId = null; // 道路完成，下一条路属于新分组
+            SetPreviewVisible(false);
         }
 
         /// <summary>从起点到点击处建一段路（直路段与弯路段共用）：
@@ -266,7 +338,9 @@ namespace RoadSystem
                 return false;
             }
 
-            if (net.AddSegment(start, end) == null)
+            // 本条道路的第一次建段：生成道路分组 Id（后续段共用，归到同一 GameObject 下）
+            if (currentRoadId == null) currentRoadId = System.Guid.NewGuid().ToString("N");
+            if (net.AddSegment(start, end, currentRoadId) == null)
             {
                 Debug.LogWarning("[RoadSystem] 路段创建失败");
                 return false;
@@ -277,12 +351,14 @@ namespace RoadSystem
         /// <summary>取消当前未完成道路：若起点为本工具新建则移除其 loose profile，并清空状态、隐藏预览。</summary>
         void CancelPending()
         {
+            if (net == null) return; // 尚未初始化（不可能有未完成道路）
             var start = PendingStart;
             if (start != null && pendingStartIsNew)
                 net.RemoveLooseProfile(start); // 仅从未接入任何段时生效
             pendingStartId = null;
             pendingStartIsNew = false;
             buildingCurve = false;
+            currentRoadId = null; // 取消后下一条路从新分组开始
             SetPreviewVisible(false);
             lastPreviewKey = null;
         }
@@ -367,7 +443,8 @@ namespace RoadSystem
             if (key == lastPreviewKey) return; // 帧合并：位置未变不重建
             lastPreviewKey = key;
 
-            if (dist < minSegmentLength)
+            // 距起点过近（虚影与起点几乎重合，无提示意义）：隐藏
+            if (dist < 0.1)
             {
                 SetPreviewVisible(false);
                 return;
@@ -382,13 +459,18 @@ namespace RoadSystem
             tmpA.Y = start.Y;
             var tmpB = Profile.Create(endPos, endDir, start.Lanes);
             var path = ProfileConnector.Connect(tmpA, tmpB);
-            if (path == null)
+
+            // 几何无解：不可建造（bad）→ 红色直线虚影提示"此处无法建造"；
+            // 合法状态却无解（理论罕见）→ 保守隐藏
+            if (path == null && !bad)
             {
                 SetPreviewVisible(false);
                 return;
             }
 
-            var mesh = SegmentMeshBuilder.Build(path, start.Lanes, start.Position, 0.05f, 6f);
+            var mesh = SegmentMeshBuilder.Build(
+                path ?? StraightHint(start.Position, endPos),
+                start.Lanes, start.Position, 0.05f, 6f);
             // 预览抬到起点 Y 之上一点，防 Z-fighting
             previewGo.transform.position = new Vector3(
                 (float)start.Position.X, start.Y + previewLift, (float)start.Position.Y);
@@ -429,6 +511,14 @@ namespace RoadSystem
         void SetPreviewVisible(bool v)
         {
             if (previewGo != null && previewGo.activeSelf != v) previewGo.SetActive(v);
+        }
+
+        /// <summary>几何无解时的红色提示路径：起点到鼠标的简单直线，只用于"此处无法建造"的视觉提示。</summary>
+        static PathChain StraightHint(DVec2 a, DVec2 b)
+        {
+            var chain = new PathChain();
+            chain.Add(new LineElement(a, b));
+            return chain;
         }
 
         /// <summary>销毁时释放预览 mesh / GameObject / 材质，防止运行时资源泄漏。</summary>

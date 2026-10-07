@@ -34,6 +34,8 @@ namespace RoadSystem
         readonly HashSet<string> dirtyNodes = new HashSet<string>();
         /// <summary>节点 Id → 派生 GameObject 的映射；便于重建/销毁时定位对应 mesh 物体。</summary>
         readonly Dictionary<string, GameObject> nodeObjects = new Dictionary<string, GameObject>();
+        /// <summary>道路分组 Id → 分组 GameObject（路段 mesh 的父物体）；一条道路（一次建造流程）一个组。</summary>
+        readonly Dictionary<string, GameObject> roadObjects = new Dictionary<string, GameObject>();
 
         /// <summary>道路材质访问器：未配置时懒创建默认 URP Lit 灰材质（仅编辑器且有对应 shader 时）。</summary>
         public Material RoadMaterial
@@ -66,11 +68,11 @@ namespace RoadSystem
             return p;
         }
 
-        /// <summary>编辑 API：用两个 profile 连成一条 RoadSegment（断面一致才成功），写存档并返回。</summary>
-        public RoadSegment AddSegment(Profile a, Profile b)
+        /// <summary>编辑 API：用两个 profile 连成一条 RoadSegment（断面一致才成功），roadId 为所属道路分组 Id，写存档并返回。</summary>
+        public RoadSegment AddSegment(Profile a, Profile b, string roadId = null)
         {
             EnsureGraph();
-            var seg = Graph.AddSegment(a, b);
+            var seg = Graph.AddSegment(a, b, roadId);
             CommitEdit();
             return seg;
         }
@@ -181,6 +183,8 @@ namespace RoadSystem
 
             foreach (var go in nodeObjects.Values) DestroyChild(go);
             nodeObjects.Clear();
+            foreach (var go in roadObjects.Values) DestroyChild(go); // 道路分组父物体（子段已先销毁）
+            roadObjects.Clear();
             dirtyNodes.Clear();
 
             foreach (var seg in Graph.Segments()) RebuildNode(seg.Id);
@@ -212,7 +216,7 @@ namespace RoadSystem
             seg.PathSolveFailed = false;
             seg.Path = path;
 
-            var go = GetOrCreateNodeObject(seg.Id, out var mf, out var mr, out var mc);
+            var go = GetOrCreateNodeObject(seg.Id, seg.RoadId, out var mf, out var mr, out var mc);
             // 几何在 XZ 2D 计算；Y 仅用于渲染抬升（取起点 profile 的 Y，避免与地面重叠）
             go.transform.position = new Vector3((float)pa.Position.X, pa.Y, (float)pa.Position.Y);
 
@@ -225,8 +229,10 @@ namespace RoadSystem
             if (oldMesh != null) DestroyChild(oldMesh);
         }
 
-        /// <summary>获取或创建某节点的派生 GameObject（带 MeshFilter/Renderer/Collider）；派生数据标记 DontSave 不入场景。</summary>
-        GameObject GetOrCreateNodeObject(string nodeId,
+        /// <summary>获取或创建某节点的派生 GameObject（带 MeshFilter/Renderer/Collider）；
+        /// roadId 非空时挂到对应道路分组物体下（一条道路一个父 GameObject），否则直接挂 RoadNetwork 根；
+        /// 派生数据标记 DontSave 不入场景。</summary>
+        GameObject GetOrCreateNodeObject(string nodeId, string roadId,
             out MeshFilter mf, out MeshRenderer mr, out MeshCollider mc)
         {
             if (!nodeObjects.TryGetValue(nodeId, out var go) || go == null)
@@ -235,7 +241,8 @@ namespace RoadSystem
                 {
                     hideFlags = HideFlags.DontSave // 派生数据不入场景
                 };
-                go.transform.SetParent(transform, false);
+                var parent = !string.IsNullOrEmpty(roadId) ? GetOrCreateRoadObject(roadId).transform : transform;
+                go.transform.SetParent(parent, false);
                 mf = go.AddComponent<MeshFilter>();
                 mr = go.AddComponent<MeshRenderer>();
                 mc = go.AddComponent<MeshCollider>();
@@ -246,6 +253,21 @@ namespace RoadSystem
                 mf = go.GetComponent<MeshFilter>();
                 mr = go.GetComponent<MeshRenderer>();
                 mc = go.GetComponent<MeshCollider>();
+            }
+            return go;
+        }
+
+        /// <summary>获取或创建道路分组 GameObject（road_{id 前 6 位}），作为该道路所有路段 mesh 的父物体。</summary>
+        GameObject GetOrCreateRoadObject(string roadId)
+        {
+            if (!roadObjects.TryGetValue(roadId, out var go) || go == null)
+            {
+                go = new GameObject($"road_{roadId.Substring(0, 6)}")
+                {
+                    hideFlags = HideFlags.DontSave // 派生数据不入场景
+                };
+                go.transform.SetParent(transform, false);
+                roadObjects[roadId] = go;
             }
             return go;
         }

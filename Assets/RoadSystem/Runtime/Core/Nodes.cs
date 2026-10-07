@@ -24,6 +24,10 @@ namespace RoadSystem.Core
     /// <summary>路段：恰好 2 个端口（起点/终点 profile）。</summary>
     public sealed class RoadSegment : RoadNodeBase
     {
+        /// <summary>所属道路分组的 Id（一次建造流程的若干路段共享同一 Id，运行时渲染据此归组）；
+        /// null/空 表示未分组（如编辑器工具画的段），直接挂在 RoadNetwork 根下。</summary>
+        public string RoadId;
+
         /// <summary>由 L1 解算出的 直线+圆弧 序列（缓存，可被标记脏）。不序列化。</summary>
         [NonSerialized] public PathChain Path;
 

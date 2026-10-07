@@ -36,13 +36,14 @@ namespace RoadSystem.Core
         /// <summary>
         /// 用两个 profile 创建路段。MVP 要求两端断面一致（等长 profile）。
         /// 成功返回 RoadSegment；断面不一致返回 null。
+        /// roadId：所属道路分组 Id（运行时三击建造的若干路段共享同一 Id），null 表示未分组。
         /// </summary>
-        public RoadSegment AddSegment(Profile a, Profile b)
+        public RoadSegment AddSegment(Profile a, Profile b, string roadId = null)
         {
             if (a == null || b == null || a == b) return null;
             if (!a.HasSameLayout(b)) return null;
 
-            var seg = new RoadSegment();
+            var seg = new RoadSegment { RoadId = roadId };
             seg.PortIds.Add(a.Id);
             seg.PortIds.Add(b.Id);
             Nodes.Add(seg.Id, seg);
