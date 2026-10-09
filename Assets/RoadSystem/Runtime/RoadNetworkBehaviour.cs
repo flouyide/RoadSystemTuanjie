@@ -77,12 +77,41 @@ namespace RoadSystem
             return seg;
         }
 
-        /// <summary>编辑 API：按 Id 删除一条路段及其端口附件，写存档。</summary>
+        /// <summary>编辑 API：按 Id 删除一条路段及其端口附件；若其端口挂着的路口因此退化（&lt;3 口），
+        /// 自动合并回普通路段。写存档。</summary>
         public void RemoveSegment(string segId)
         {
             EnsureGraph();
+            // 记录该段 ports 挂的路口（删段后可能退化）
+            var ixIds = new List<string>();
+            if (Graph.GetNode(segId) is RoadSegment seg)
+            {
+                foreach (var pid in seg.PortIds)
+                {
+                    var p = Graph.GetProfile(pid);
+                    if (p == null) continue;
+                    foreach (var nid in new[] { p.NodeAId, p.NodeBId })
+                        if (!string.IsNullOrEmpty(nid)
+                            && Graph.GetNode(nid) is Intersection && !ixIds.Contains(nid))
+                            ixIds.Add(nid);
+                }
+            }
             Graph.RemoveSegment(segId);
+            foreach (var ixId in ixIds) IntersectionBuilder.MergeDegenerate(Graph, ixId);
             CommitEdit();
+        }
+
+        /// <summary>M4：检测新段与全图的交汇并自动生成路口（拆分/截断/建 Intersection/车道配对）。
+        /// 图有变更时返回 true 并写存档；无交汇返回 false。</summary>
+        public bool AutoBuildIntersections(string newSegId)
+        {
+            EnsureGraph();
+            if (IntersectionBuilder.DetectAndBuild(Graph, newSegId))
+            {
+                CommitEdit();
+                return true;
+            }
+            return false;
         }
 
         /// <summary>编辑 API：删除一个悬空端 Profile（仅当它未接入任何节点时生效），写存档。</summary>
@@ -187,16 +216,27 @@ namespace RoadSystem
             roadObjects.Clear();
             dirtyNodes.Clear();
 
-            foreach (var seg in Graph.Segments()) RebuildNode(seg.Id);
+            foreach (var n in Graph.Nodes.Values) RebuildNode(n.Id); // 段 + 路口（M4）
         }
 
-        /// <summary>按节点 Id 分派重建：路段重建 mesh，路口（M4 功能）当前跳过。</summary>
+        /// <summary>按节点 Id 分派重建：路段重建 mesh、路口重建铺装面（M4）；
+        /// 节点已被删除则销毁其派生物体（拆分/删除后的清理）。</summary>
         void RebuildNode(string nodeId)
         {
             var node = Graph.GetNode(nodeId);
+            if (node == null)
+            {
+                if (nodeObjects.TryGetValue(nodeId, out var dead) && dead != null)
+                {
+                    DestroyChild(dead);
+                    nodeObjects.Remove(nodeId);
+                }
+                return;
+            }
             if (node is RoadSegment seg)
                 RebuildSegment(seg);
-            // Intersection 网格生成属于 M4，当前版本跳过
+            else if (node is Intersection ix)
+                RebuildIntersection(ix);
         }
 
         /// <summary>重建单个路段：取两端 profile→解路型→生成 mesh→挂到派生物体（含 MeshCollider），并释放旧 mesh。</summary>
@@ -223,6 +263,33 @@ namespace RoadSystem
             var oldMesh = mf.sharedMesh;
             var mesh = SegmentMeshBuilder.Build(path, pa.Lanes, pa.Position, sagitta, texturePeriod);
             mesh.name = $"RoadSegment_{seg.Id.Substring(0, 6)}";
+            mf.sharedMesh = mesh;
+            mr.sharedMaterial = RoadMaterial;
+            if (mc != null) mc.sharedMesh = mesh;
+            if (oldMesh != null) DestroyChild(oldMesh);
+        }
+
+        /// <summary>重建单个路口（M4）：收集接通 ports → 极角序边界环（转角 fillet）→ 耳切三角化铺装 mesh；
+        /// 挂点取路口中心与平均 port 高度，路口物体直接挂 RoadNetwork 根（不归道路分组）。</summary>
+        void RebuildIntersection(Intersection ix)
+        {
+            var ports = IntersectionBuilder.LivePorts(Graph, ix);
+            if (ports.Count < 3) return; // 退化（待合并清理），不生成网格
+
+            var center = IntersectionBuilder.CenterOf(ports);
+            var loop = IntersectionBuilder.BuildBoundaryLoop(ports, center, sagitta);
+            if (loop == null || loop.Count < 3) return;
+
+            double avgY = 0;
+            foreach (var p in ports) avgY += p.Y;
+            avgY /= ports.Count;
+
+            var go = GetOrCreateNodeObject(ix.Id, null, out var mf, out var mr, out var mc);
+            go.transform.position = new Vector3((float)center.X, (float)avgY, (float)center.Y);
+
+            var oldMesh = mf.sharedMesh;
+            var mesh = IntersectionMeshBuilder.Build(loop, center, (float)avgY, vPeriod: texturePeriod);
+            mesh.name = $"Intersection_{ix.Id.Substring(0, 6)}";
             mf.sharedMesh = mesh;
             mr.sharedMaterial = RoadMaterial;
             if (mc != null) mc.sharedMesh = mesh;

@@ -35,6 +35,7 @@ namespace RoadSystem.Meshing
             double W = 0;
             foreach (var l in lanes) W += l.Width;
 
+            
             // 各车道边界横向坐标（0=左缘）
             var b = new double[lanes.Length + 1];
             for (int i = 0; i < lanes.Length; i++) b[i + 1] = b[i] + lanes[i].Width;

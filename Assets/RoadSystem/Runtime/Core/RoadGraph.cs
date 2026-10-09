@@ -56,7 +56,8 @@ namespace RoadSystem.Core
         public void RemoveSegment(string segId)
         {
             if (!Nodes.TryGetValue(segId, out var node)) return;
-            var affected = new List<string>();
+            // 被删段自身也进入受影响集合：宿主据此销毁其派生 mesh 物体
+            var affected = new List<string> { segId };
             foreach (var pid in node.PortIds)
             {
                 if (Profiles.TryGetValue(pid, out var p))
@@ -71,6 +72,9 @@ namespace RoadSystem.Core
             Nodes.Remove(segId);
             if (affected.Count > 0) NotifyAffected(affected);
         }
+
+        /// <summary>把受影响节点 Id 集合对外广播（路口构建等 L1 层图编辑用）。</summary>
+        public void NotifyChanged(IReadOnlyList<string> ids) => NotifyAffected(ids);
 
         /// <summary>删除一个 profile 及其唯一关联的悬空段（编辑器取消放置用）。</summary>
         public void RemoveLooseProfile(Profile p)

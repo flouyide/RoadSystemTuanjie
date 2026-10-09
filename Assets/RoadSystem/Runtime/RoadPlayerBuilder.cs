@@ -340,11 +340,15 @@ namespace RoadSystem
 
             // 本条道路的第一次建段：生成道路分组 Id（后续段共用，归到同一 GameObject 下）
             if (currentRoadId == null) currentRoadId = System.Guid.NewGuid().ToString("N");
-            if (net.AddSegment(start, end, currentRoadId) == null)
+            var seg = net.AddSegment(start, end, currentRoadId);
+            if (seg == null)
             {
                 Debug.LogWarning("[RoadSystem] 路段创建失败");
                 return false;
             }
+
+            // M4 交汇检测：新段穿越/接上既有路段时自动拆分并生成路口（T 型 / 十字）
+            net.AutoBuildIntersections(seg.Id);
             return true;
         }
 
