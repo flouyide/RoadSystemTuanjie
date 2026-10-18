@@ -28,6 +28,12 @@ namespace RoadSystem.Core
         {
             p.Position = newPos;
             p.Direction = newDir.Normalized;
+            foreach (var nodeId in new[] { p.NodeAId, p.NodeBId })
+                if (GetNode(nodeId) is RoadSegment segment)
+                {
+                    segment.Path = null;
+                    segment.ExplicitPath = null;
+                }
             NotifyAffected(AffectedByProfile(p));
         }
 
@@ -42,6 +48,7 @@ namespace RoadSystem.Core
         {
             if (a == null || b == null || a == b) return null;
             if (!a.HasSameLayout(b)) return null;
+            if (!a.IsLooseEnd || !b.IsLooseEnd) return null;
 
             var seg = new RoadSegment { RoadId = roadId };
             seg.PortIds.Add(a.Id);

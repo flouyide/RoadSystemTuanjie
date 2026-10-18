@@ -28,6 +28,9 @@ namespace RoadSystem.Core
         /// null/空 表示未分组（如编辑器工具画的段），直接挂在 RoadNetwork 根下。</summary>
         public string RoadId;
 
+        /// <summary>Explicit line/arc geometry for controlled curves and intersection fragments.</summary>
+        public List<PathElementDto> ExplicitPath;
+
         /// <summary>由 L1 解算出的 直线+圆弧 序列（缓存，可被标记脏）。不序列化。</summary>
         [NonSerialized] public PathChain Path;
 

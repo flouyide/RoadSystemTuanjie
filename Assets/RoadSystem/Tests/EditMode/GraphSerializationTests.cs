@@ -1,5 +1,8 @@
 using NUnit.Framework;
 using RoadSystem.Core;
+using RoadSystem.Geometry;
+using System;
+using System.Linq;
 
 namespace RoadSystem.Tests
 {
@@ -26,6 +29,19 @@ namespace RoadSystem.Tests
             var pb = g.CreateProfile(new DVec2(30, 0), new DVec2(1, 0),
                 new[] { new LaneDef(LaneType.Car, 3.5f) });
             Assert.IsNull(g.AddSegment(pa, pb), "断面不一致应拒绝");
+        }
+
+        [Test]
+        public void AddSegment_RejectsOccupiedIntersectionPort()
+        {
+            var g = new RoadGraph();
+            var pa = g.CreateProfile(new DVec2(0, 0), new DVec2(1, 0));
+            var pb = g.CreateProfile(new DVec2(30, 0), new DVec2(1, 0));
+            var pc = g.CreateProfile(new DVec2(60, 0), new DVec2(1, 0));
+            var pd = g.CreateProfile(new DVec2(90, 0), new DVec2(1, 0));
+            Assert.NotNull(g.AddSegment(pa, pb));
+            Assert.NotNull(g.AddSegment(pb, pc));
+            Assert.IsNull(g.AddSegment(pb, pd), "端口已连接两个实体时不可再挂第三个");
         }
 
         [Test]
@@ -66,6 +82,60 @@ namespace RoadSystem.Tests
             g.MoveProfile(pa, new DVec2(0, 1), new DVec2(1, 0));
             Assert.AreEqual(1, fired);
             Assert.Greater(seg.DirtyVersion, 0);
+        }
+
+        [Test]
+        public void ControlPointCurve_UsesTangentCircularArc_AndRejectsTightTurns()
+        {
+            var a = new DVec2(0, 0);
+            var c = new DVec2(40, 0);
+            var b = new DVec2(40, 40);
+            var path = ControlPointCurve.Solve(a, c, b, 1, 6, out var reason);
+            Assert.IsNull(reason);
+            Assert.AreEqual(1, path.Elements.Count);
+            var arc = (ArcElement)path.Elements[0];
+            Assert.That(arc.Radius, Is.EqualTo(40).Within(1e-6));
+            Assert.That(arc.Sweep, Is.EqualTo(Math.PI / 2).Within(1e-6));
+            Assert.True(path.StartPoint.ApproxEquals(a));
+            Assert.True(path.EndPoint.ApproxEquals(b));
+            Assert.True(path.StartTangent.ApproxEquals(DVec2.UnitX));
+            Assert.True(path.EndTangent.ApproxEquals(DVec2.UnitY));
+            Assert.IsNull(ControlPointCurve.Solve(a, new DVec2(2, 0),
+                new DVec2(2, 2), 1, 6, out _));
+        }
+
+        [Test]
+        public void ControlledCurve_IntersectionFragmentsSurviveJsonRoundTrip()
+        {
+            var graph = new RoadGraph();
+            var start = graph.CreateProfile(new DVec2(-100, 0), DVec2.UnitX);
+            var end = graph.CreateProfile(new DVec2(0, 100), DVec2.UnitY);
+            var path = ControlPointCurve.Solve(start.Position, new DVec2(0, 0),
+                end.Position, 1, 6, out _);
+            var curve = graph.AddSegment(start, end);
+            curve.Path = path;
+            curve.ExplicitPath = SegmentPathResolver.Store(path);
+            var crossStart = graph.CreateProfile(new DVec2(-130, 30), DVec2.UnitX);
+            var crossEnd = graph.CreateProfile(new DVec2(30, 30), DVec2.UnitX);
+            Assert.True(IntersectionBuilder.CanBuildRoad(graph, crossStart, crossEnd,
+                null, out var reason), reason);
+            var crossing = graph.AddSegment(crossStart, crossEnd);
+            Assert.True(IntersectionBuilder.DetectAndBuild(graph, crossing.Id));
+            var arcFragments = graph.Segments().Where(s =>
+                SegmentPathResolver.Resolve(graph, s).Elements.OfType<ArcElement>().Any()).ToList();
+            Assert.Greater(arcFragments.Count, 0);
+
+            var restored = RoadGraphJson.FromJson(RoadGraphJson.ToJson(graph));
+            foreach (var fragment in arcFragments)
+            {
+                var restoredSegment = (RoadSegment)restored.GetNode(fragment.Id);
+                Assert.NotNull(restoredSegment.ExplicitPath);
+                var before = SegmentPathResolver.Resolve(graph, fragment);
+                var after = SegmentPathResolver.Resolve(restored, restoredSegment);
+                Assert.True(after.StartPoint.ApproxEquals(before.StartPoint));
+                Assert.True(after.EndPoint.ApproxEquals(before.EndPoint));
+                Assert.That(after.TotalLength, Is.EqualTo(before.TotalLength).Within(1e-5));
+            }
         }
     }
 }

@@ -18,8 +18,15 @@ namespace RoadSystem
         [SerializeField, HideInInspector] string graphJson = "";
         /// <summary>道路渲染材质；为空时由 RoadMaterial 懒创建默认 URP Lit 灰材质。</summary>
         [SerializeField] Material roadMaterial;
+        /// <summary>路口专用材质；编辑器中未指定时自动引用 M_Intersection.mat。</summary>
+        [SerializeField] Material intersectionMaterial;
         /// <summary>弧段采样弦高误差（米），越小弧线越圆滑、三角面越多。</summary>
         [SerializeField, Tooltip("弧段采样弦高误差（米），越小越圆滑")] float sagitta = 0.05f;
+        /// <summary>路口转角期望圆角半径（米）；空间不足时自动缩小。</summary>
+        [SerializeField, Min(0f), Tooltip("路口转角半径（米）；空间不足时自动缩小")]
+        float intersectionCornerRadius = 5f;
+        /// <summary>路口边缘形状：0 为现有圆角，1 为直边；由 RoadPlayerBuilder 配置。</summary>
+        float intersectionCurve;
         /// <summary>路面贴图沿道路方向的重复周期（米），控制贴图拉伸密度。</summary>
         [SerializeField, Tooltip("路面贴图沿道路方向的重复周期（米）")] float texturePeriod = 6f;
 
@@ -36,6 +43,7 @@ namespace RoadSystem
         readonly Dictionary<string, GameObject> nodeObjects = new Dictionary<string, GameObject>();
         /// <summary>道路分组 Id → 分组 GameObject（路段 mesh 的父物体）；一条道路（一次建造流程）一个组。</summary>
         readonly Dictionary<string, GameObject> roadObjects = new Dictionary<string, GameObject>();
+        bool warnedMissingIntersectionMaterial;
 
         /// <summary>道路材质访问器：未配置时懒创建默认 URP Lit 灰材质（仅编辑器且有对应 shader 时）。</summary>
         public Material RoadMaterial
@@ -56,6 +64,64 @@ namespace RoadSystem
             set => roadMaterial = value;
         }
 
+        public Material IntersectionMaterial
+        {
+            get
+            {
+#if UNITY_EDITOR
+                if (intersectionMaterial == null)
+                    AssignDefaultIntersectionMaterial();
+#endif
+                if (intersectionMaterial == null && !warnedMissingIntersectionMaterial)
+                {
+                    Debug.LogWarning("[RoadSystem] 未指定 M_Intersection 路口材质，暂用道路材质显示。", this);
+                    warnedMissingIntersectionMaterial = true;
+                }
+                return intersectionMaterial != null ? intersectionMaterial : RoadMaterial;
+            }
+            set
+            {
+                intersectionMaterial = value;
+                warnedMissingIntersectionMaterial = false;
+                ForceRebuild();
+            }
+        }
+
+        /// <summary>路口边缘从现有圆角到直边的插值；变动时重建已有路口。</summary>
+        public float IntersectionCurve
+        {
+            get => intersectionCurve;
+            set
+            {
+                float clamped = Mathf.Clamp01(value);
+                if (Mathf.Approximately(intersectionCurve, clamped)) return;
+                intersectionCurve = clamped;
+                ForceRebuild();
+            }
+        }
+
+#if UNITY_EDITOR
+        const string IntersectionMaterialPath = "Assets/RoadSystem/Materials/M_Intersection.mat";
+
+        void OnValidate()
+        {
+            ForceRebuild();
+            if (intersectionMaterial == null)
+                UnityEditor.EditorApplication.delayCall += AssignDefaultIntersectionMaterial;
+        }
+
+        void AssignDefaultIntersectionMaterial()
+        {
+            if (this == null || intersectionMaterial != null) return;
+            var material = UnityEditor.AssetDatabase.LoadAssetAtPath<Material>(IntersectionMaterialPath);
+            if (material == null) return;
+            intersectionMaterial = material;
+            warnedMissingIntersectionMaterial = false;
+            UnityEditor.EditorUtility.SetDirty(this);
+            ForceRebuild();
+        }
+#endif
+
         // ---------------- 编辑 API（编辑器层调用；调用前须 Undo.RecordObject） ----------------
 
         /// <summary>编辑 API：在图里新建一个端点 Profile（悬空端），y 须随本调用写入（内部会立即序列化存档，事后再改 Y 会被下次整图重建还原成旧值），写存档并返回该 profile。</summary>
@@ -75,6 +141,30 @@ namespace RoadSystem
             var seg = Graph.AddSegment(a, b, roadId);
             CommitEdit();
             return seg;
+        }
+
+        /// <summary>Commit a controlled curve as one graph edit after its path has passed preflight.</summary>
+        public RoadSegment AddControlledCurve(Profile existingStart, DVec2 startPos, float startY,
+            Profile existingEnd, DVec2 endPos, float endY, LaneDef[] lanes,
+            PathChain path, string roadId)
+        {
+            EnsureGraph();
+            if (path == null || path.Elements.Count == 0) return null;
+            var start = existingStart ?? Graph.CreateProfile(startPos, path.StartTangent, lanes);
+            if (existingStart == null) start.Y = startY;
+            var end = existingEnd ?? Graph.CreateProfile(endPos, path.EndTangent, lanes);
+            if (existingEnd == null) end.Y = endY;
+            var segment = Graph.AddSegment(start, end, roadId);
+            if (segment == null)
+            {
+                if (existingStart == null) Graph.RemoveLooseProfile(start);
+                if (existingEnd == null) Graph.RemoveLooseProfile(end);
+                return null;
+            }
+            segment.Path = path;
+            segment.ExplicitPath = SegmentPathResolver.Store(path);
+            CommitEdit();
+            return segment;
         }
 
         /// <summary>编辑 API：按 Id 删除一条路段及其端口附件；若其端口挂着的路口因此退化（&lt;3 口），
@@ -150,6 +240,10 @@ namespace RoadSystem
         {
             EnsureGraph();
             appliedJson = null; // 强制全量重建
+#if UNITY_EDITOR
+            if (intersectionMaterial == null)
+                UnityEditor.EditorApplication.delayCall += AssignDefaultIntersectionMaterial;
+#endif
         }
 
         /// <summary>禁用时解绑 Graph.Changed 事件，避免悬空引用/重复触发。</summary>
@@ -247,7 +341,8 @@ namespace RoadSystem
             var pb = Graph.GetProfile(seg.PortIds[1]);
             if (pa == null || pb == null) return;
 
-            var path = ProfileConnector.Connect(pa, pb);
+            seg.Path = null;
+            var path = SegmentPathResolver.Resolve(Graph, seg);
             if (path == null)
             {
                 seg.PathSolveFailed = true;
@@ -275,9 +370,11 @@ namespace RoadSystem
         {
             var ports = IntersectionBuilder.LivePorts(Graph, ix);
             if (ports.Count < 3) return; // 退化（待合并清理），不生成网格
+            IntersectionBuilder.RefreshLanePaths(Graph, ix);
 
             var center = IntersectionBuilder.CenterOf(ports);
-            var loop = IntersectionBuilder.BuildBoundaryLoop(ports, center, sagitta);
+            var loop = IntersectionBuilder.BuildBoundaryLoop(ports, center, sagitta,
+                intersectionCornerRadius, intersectionCurve);
             if (loop == null || loop.Count < 3) return;
 
             double avgY = 0;
@@ -285,13 +382,15 @@ namespace RoadSystem
             avgY /= ports.Count;
 
             var go = GetOrCreateNodeObject(ix.Id, null, out var mf, out var mr, out var mc);
+            go.name = $"Inter_{ix.Id}";
             go.transform.position = new Vector3((float)center.X, (float)avgY, (float)center.Y);
 
             var oldMesh = mf.sharedMesh;
             var mesh = IntersectionMeshBuilder.Build(loop, center, (float)avgY, vPeriod: texturePeriod);
+            if (mesh == null) return;
             mesh.name = $"Intersection_{ix.Id.Substring(0, 6)}";
             mf.sharedMesh = mesh;
-            mr.sharedMaterial = RoadMaterial;
+            mr.sharedMaterial = IntersectionMaterial;
             if (mc != null) mc.sharedMesh = mesh;
             if (oldMesh != null) DestroyChild(oldMesh);
         }

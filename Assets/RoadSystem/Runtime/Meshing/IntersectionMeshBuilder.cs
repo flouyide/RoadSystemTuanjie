@@ -9,16 +9,13 @@ namespace RoadSystem.Meshing
     /// <summary>
     /// M4 路口网格构建（plan §5.3 过渡面三角化）：
     /// 输入边界环（IntersectionBuilder.BuildBoundaryLoop 的输出，含 fillet 转角采样点），
-    /// 以路口中心为扇心 fan 三角化生成铺装顶面（星形域假设；转角内凹已在环构建时退化为直线），
+    /// 用耳切法三角化铺装顶面，支持斜交产生的凹边界环，
     /// 并沿环边生成外缘立面（顶面落到 -curb）。
     ///
-    /// fan 相比耳切的优势：所有三角形共享扇心、绕序绝对一致，不存在"部分三角朝上部分朝下"
-    /// 被背面剔除露出地面的风险（截图 bug 的根因）。
-    ///
-    /// 顶点布局：顶面 = 扇心 1 个 + 环点 n 个；立面独立顶点 2n 个（硬边光影）。
+    /// 顶点布局：顶面 = 环点 n 个；立面独立顶点 2n 个（硬边光影）。
     /// UV：世界对齐的 XZ / vPeriod 采样，密度与路段贴图周期（6m）一致。
     /// 注意：DVec2 的数学 CCW（XZ 平面 atan2 序）与 Unity 三角正面绕序相反——
-    /// fan 三角统一用 (center, v_{i+1}, v_i) 使正面朝上。
+    /// 每个 CCW 耳三角反转为 Unity 正面绕序，使正面朝上。
     /// </summary>
     public static class IntersectionMeshBuilder
     {
@@ -37,10 +34,7 @@ namespace RoadSystem.Meshing
             int n = loop.Count;
             if (n >= 3)
             {
-                // ---------- 顶面顶点：index 0 = 扇心（路口中心），index 1..n = 环点 ----------
-                verts.Add(new Vector3(0, 0, 0)); // 扇心（局部原点）
-                normals.Add(Vector3.up);
-                uvs.Add(Vector2.zero);
+                // ---------- 顶面环点 ----------
                 for (int i = 0; i < n; i++)
                 {
                     var p = loop[i];
@@ -51,12 +45,13 @@ namespace RoadSystem.Meshing
                         (float)(p.Pos.X - origin.X) / vPeriod, (float)(p.Pos.Y - origin.Y) / vPeriod));
                 }
 
-                // ---------- 顶面 fan 三角：(center, v_{i+1}, v_i) —— 统一绕序、正面朝上 ----------
-                for (int i = 0; i < n; i++)
+                var ccwTriangles = new List<int>();
+                if (!PolygonTriangulator.TryTriangulate(loop, ccwTriangles)) return null;
+                for (int i = 0; i < ccwTriangles.Count; i += 3)
                 {
-                    int a = 1 + i;               // v_i
-                    int b = 1 + (i + 1) % n;     // v_{i+1}
-                    tris.Add(0); tris.Add(b); tris.Add(a);
+                    tris.Add(ccwTriangles[i]);
+                    tris.Add(ccwTriangles[i + 2]);
+                    tris.Add(ccwTriangles[i + 1]);
                 }
 
                 // ---------- 外缘立面（独立顶点：top [topBase, topBase+n)，bottom [botBase, botBase+n)） ----------
@@ -81,12 +76,12 @@ namespace RoadSystem.Meshing
                     var e = loop[j].Pos - loop[i].Pos;
                     var nrm = new Vector3((float)e.Y, 0, -(float)e.X).normalized;
                     normals.Add(nrm);
-                    uvs.Add(uvs[1 + i]);
+                    uvs.Add(uvs[i]);
                 }
                 for (int i = 0; i < n; i++)
                 {
                     normals.Add(Vector3.down);
-                    uvs.Add(uvs[1 + i]);
+                    uvs.Add(uvs[i]);
                 }
 
                 for (int i = 0; i < n; i++)

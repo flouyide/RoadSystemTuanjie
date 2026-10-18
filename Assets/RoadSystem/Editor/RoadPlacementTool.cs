@@ -19,6 +19,7 @@ namespace RoadSystem.EditorTools
     public class RoadPlacementTool : EditorTool
     {
         const double LooseEndSnapDist = 3.0;   // 悬空端吸附半径（米）
+        const double RoadCenterSnapDist = 6.0; // 路面内点击吸附到路段中心线，用于 T 型路口
         const double DragDirThreshold = 2.0;   // 拖拽定向阈值（米）
         const double MinSegmentLength = 1.0;   // 最小路段长度（米）
         const double AngleSnapDeg = 15.0;
@@ -30,6 +31,7 @@ namespace RoadSystem.EditorTools
         // ---- 工具状态 ----
         Profile pendingStart;      // 待连接起点（已在图中）
         bool pendingStartIsNew;    // 由本工具新建（Esc 可移除）
+        bool pendingStartOnRoad;   // 起点吸附既有路段，下一击自动确定出发切向
         bool dragging;
         DVec2 downPos;
         DVec2 hoverPos;
@@ -43,6 +45,7 @@ namespace RoadSystem.EditorTools
         Material previewMatBad;
         string lastPreviewKey;
         bool previewBad;           // 当前预览是否处于非法/警示状态
+        string previewFailureReason;
 
         RoadNetworkBehaviour Net => target as RoadNetworkBehaviour;
 
@@ -55,6 +58,7 @@ namespace RoadSystem.EditorTools
         {
             DestroyPreview();
             pendingStart = null;
+            pendingStartOnRoad = false;
             dragging = false;
         }
 
@@ -133,30 +137,58 @@ namespace RoadSystem.EditorTools
                 {
                     pendingStart = loose;
                     pendingStartIsNew = false;
+                    pendingStartOnRoad = false;
                 }
                 else
                 {
+                    DVec2 startPos = downPos;
+                    DVec2 roadPoint = startPos;
+                    bool startSnapped = !e.control && IntersectionBuilder.TrySnapToRoad(net.Graph, startPos,
+                        RoadCenterSnapDist, out roadPoint);
+                    if (startSnapped) startPos = roadPoint;
+                    pendingStartOnRoad = startSnapped && !dragged;
                     DVec2 dir = dragged
                         ? SnapAngle((upPos - downPos).Normalized, e)
                         : DVec2.UnitY; // 默认 +Z
                     Undo.RecordObject(net, "Place Road Profile");
-                    pendingStart = net.PlaceProfile(downPos, dir, Profile.DefaultLanes());
+                    pendingStart = net.PlaceProfile(startPos, dir, Profile.DefaultLanes());
                     pendingStartIsNew = true;
                 }
             }
             else
             {
-                // 终点过近：忽略
-                if (DVec2.Distance(downPos, pendingStart.Position) < MinSegmentLength)
-                    return;
-
                 // 终点：吸附既有悬空端则复用
                 var loose = FindLooseEnd(net, downPos);
                 Profile end;
                 bool endIsReused = loose != null && loose.Id != pendingStart.Id;
+                DVec2 endPos = endIsReused ? loose.Position : downPos;
+                if (!endIsReused && !e.control && IntersectionBuilder.TrySnapToRoad(net.Graph, endPos,
+                    RoadCenterSnapDist, out var roadPoint)) endPos = roadPoint;
+                if (DVec2.Distance(endPos, pendingStart.Position) < MinSegmentLength) return;
+                DVec2 startDir = pendingStartOnRoad
+                    ? (endPos - pendingStart.Position).Normalized : pendingStart.Direction;
 
                 // 半平面约束：落点在源后方 → 强制同向
-                bool behind = DVec2.Dot(downPos - pendingStart.Position, pendingStart.Direction) < 0;
+                bool behind = DVec2.Dot(endPos - pendingStart.Position, startDir) < 0;
+                DVec2 endDir = endIsReused ? loose.Direction
+                    : behind ? startDir
+                    : dragged ? SnapAngle((upPos - downPos).Normalized, e)
+                    : (endPos - pendingStart.Position).Normalized;
+                var checkStart = Profile.Create(pendingStart.Position, startDir, pendingStart.Lanes);
+                checkStart.Id = pendingStart.Id;
+                var checkEnd = Profile.Create(endPos, endDir,
+                    endIsReused ? loose.Lanes : pendingStart.Lanes);
+                if (endIsReused) checkEnd.Id = loose.Id;
+                if (!IntersectionBuilder.CanBuildRoad(net.Graph, checkStart, checkEnd, null,
+                    out var failureReason))
+                {
+                    Debug.LogWarning($"[RoadSystem] 无法建造道路：{failureReason}");
+                    return;
+                }
+
+                Undo.RecordObject(net, "Add Road Segment");
+                if (pendingStartOnRoad)
+                    net.MoveProfile(pendingStart, pendingStart.Position, startDir);
 
                 if (endIsReused)
                 {
@@ -164,13 +196,7 @@ namespace RoadSystem.EditorTools
                 }
                 else
                 {
-                    DVec2 dir;
-                    if (behind) dir = pendingStart.Direction;
-                    else if (dragged) dir = SnapAngle((upPos - downPos).Normalized, e);
-                    else dir = (downPos - pendingStart.Position).Normalized;
-
-                    Undo.RecordObject(net, "Add Road Segment");
-                    end = net.PlaceProfile(downPos, dir, (LaneDef[])pendingStart.Lanes.Clone());
+                    end = net.PlaceProfile(endPos, endDir, (LaneDef[])pendingStart.Lanes.Clone());
                 }
 
                 var seg = net.AddSegment(pendingStart, end);
@@ -179,8 +205,10 @@ namespace RoadSystem.EditorTools
                     Debug.LogWarning("[RoadSystem] 路段创建失败（断面不一致或参数非法）");
                     return;
                 }
-                pendingStart = end;
-                pendingStartIsNew = !endIsReused;
+                net.AutoBuildIntersections(seg.Id);
+                pendingStart = end.IsLooseEnd ? end : null;
+                pendingStartIsNew = pendingStart != null && !endIsReused;
+                pendingStartOnRoad = false;
             }
         }
 
@@ -193,6 +221,7 @@ namespace RoadSystem.EditorTools
             }
             pendingStart = null;
             pendingStartIsNew = false;
+            pendingStartOnRoad = false;
             dragging = false;
             ClearPreviewMesh();
         }
@@ -206,40 +235,57 @@ namespace RoadSystem.EditorTools
             {
                 ClearPreviewMesh();
                 previewGo.SetActive(false);
+                previewFailureReason = null;
                 return;
             }
 
             DVec2 endPos = SnapPos(hoverPos, Event.current);
+            var loose = FindLooseEnd(net, endPos);
+            if (loose != null) endPos = loose.Position;
+            else if ((Event.current == null || !Event.current.control)
+                && IntersectionBuilder.TrySnapToRoad(net.Graph, endPos, RoadCenterSnapDist,
+                out var roadPoint)) endPos = roadPoint;
             double dist = DVec2.Distance(endPos, pendingStart.Position);
-            bool behind = DVec2.Dot(endPos - pendingStart.Position, pendingStart.Direction) < 0;
+            DVec2 startDir = pendingStartOnRoad && dist > 0.1
+                ? (endPos - pendingStart.Position).Normalized : pendingStart.Direction;
+            bool behind = DVec2.Dot(endPos - pendingStart.Position, startDir) < 0;
             bool tooShort = dist < MinSegmentLength;
 
             DVec2 endDir;
-            if (behind) endDir = pendingStart.Direction;
+            if (loose != null) endDir = loose.Direction;
+            else if (behind) endDir = startDir;
             else if (dragging && DVec2.Distance(endPos, downPos) >= DragDirThreshold)
                 endDir = SnapAngle((endPos - downPos).Normalized, Event.current);
             else if (dist > 0.1) endDir = (endPos - pendingStart.Position).Normalized;
-            else endDir = pendingStart.Direction;
+            else endDir = startDir;
 
             previewBad = behind || tooShort;
-
-            string key = $"{endPos.X:F2},{endPos.Y:F2},{endDir.X:F3},{endDir.Y:F3},{previewBad}";
-            if (key == lastPreviewKey) return; // 帧合并：位置未变不重建
-            lastPreviewKey = key;
-
             if (tooShort)
             {
                 previewGo.SetActive(false);
+                previewFailureReason = null;
+                lastPreviewKey = null;
                 return;
             }
 
-            var tmpA = Profile.Create(pendingStart.Position, pendingStart.Direction, pendingStart.Lanes);
-            var tmpB = Profile.Create(endPos, endDir, pendingStart.Lanes);
+            var tmpA = Profile.Create(pendingStart.Position, startDir, pendingStart.Lanes);
+            tmpA.Id = pendingStart.Id;
+            var tmpB = Profile.Create(endPos, endDir,
+                loose != null ? loose.Lanes : pendingStart.Lanes);
+            if (loose != null) tmpB.Id = loose.Id;
             var path = ProfileConnector.Connect(tmpA, tmpB);
+            if (!IntersectionBuilder.CanBuildRoad(net.Graph, tmpA, tmpB, null,
+                out previewFailureReason)) previewBad = true;
+
+            string key = $"{endPos.X:F2},{endPos.Y:F2},{startDir.X:F3},{startDir.Y:F3}," +
+                $"{endDir.X:F3},{endDir.Y:F3},{previewBad},{net.Graph.Nodes.Count}";
+            if (key == lastPreviewKey) return; // 帧合并：位置未变不重建
+            lastPreviewKey = key;
+
             if (path == null)
             {
-                previewGo.SetActive(false);
-                return;
+                path = new PathChain();
+                path.Add(new LineElement(pendingStart.Position, endPos));
             }
 
             var mesh = SegmentMeshBuilder.Build(path, pendingStart.Lanes, pendingStart.Position, 0.05f, 6f);
@@ -340,6 +386,9 @@ namespace RoadSystem.EditorTools
                     Handles.Label(ToV3(hoverPos) + Vector3.up * 2,
                         "后方半平面：朝向已锁定为源方向", EditorStyles.boldLabel);
                 }
+                if (hoverValid && !string.IsNullOrEmpty(previewFailureReason))
+                    Handles.Label(ToV3(hoverPos) + Vector3.up * 3,
+                        $"无法建造道路：{previewFailureReason}", EditorStyles.boldLabel);
             }
 
             // 操作提示

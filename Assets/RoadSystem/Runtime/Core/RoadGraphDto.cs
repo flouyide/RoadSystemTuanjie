@@ -30,6 +30,18 @@ namespace RoadSystem.Core
 
     /// <summary>路网物理实体（路段或路口）的序列化镜像。</summary>
     [Serializable]
+    public class PathElementDto
+    {
+        public string Kind; // "line" | "arc"
+        public DVec2 A;
+        public DVec2 B;
+        public DVec2 Center;
+        public double Radius;
+        public double StartAngle;
+        public double Sweep;
+    }
+
+    [Serializable]
     public class NodeDto
     {
         /// <summary>节点唯一标识（Guid 字符串）。</summary>
@@ -40,6 +52,8 @@ namespace RoadSystem.Core
         public List<string> PortIds = new List<string>();
         /// <summary>所属道路分组 Id（仅 segment 使用；一次建造流程的若干路段共享同一 Id）。</summary>
         public string RoadId;
+        /// <summary>Exact line/arc path for manually controlled or split segments.</summary>
+        public List<PathElementDto> ExplicitPath;
         /// <summary>显式车道级转向连接（仅 intersection 使用；路段为空）。</summary>
         public List<LaneConnection> LaneLinks = new List<LaneConnection>(); // 仅 intersection
     }
@@ -48,8 +62,8 @@ namespace RoadSystem.Core
     [Serializable]
     public class RoadGraphDto
     {
-        /// <summary>序列化格式版本号，便于未来做兼容/迁移（当前固定为 1）。</summary>
-        public int Version = 1;
+        /// <summary>版本 2 增加可选的显式直线/圆弧路径；旧数据仍按端点求解。</summary>
+        public int Version = 2;
         /// <summary>所有 Profile（端点）的扁平列表，对应 RoadGraph.Profiles 字典。</summary>
         public List<ProfileDto> Profiles = new List<ProfileDto>();
         /// <summary>所有节点（路段/路口）的扁平列表，对应 RoadGraph.Nodes 字典。</summary>
@@ -90,7 +104,9 @@ namespace RoadSystem.Core
                 else
                 {
                     nd.Kind = "segment";
-                    nd.RoadId = ((RoadSegment)n).RoadId;
+                    var segment = (RoadSegment)n;
+                    nd.RoadId = segment.RoadId;
+                    nd.ExplicitPath = segment.ExplicitPath;
                 }
                 dto.Nodes.Add(nd);
             }
@@ -129,7 +145,7 @@ namespace RoadSystem.Core
                 }
                 else
                 {
-                    var seg = new RoadSegment { RoadId = nd.RoadId };
+                    var seg = new RoadSegment { RoadId = nd.RoadId, ExplicitPath = nd.ExplicitPath };
                     n = seg;
                 }
                 n.Id = nd.Id;

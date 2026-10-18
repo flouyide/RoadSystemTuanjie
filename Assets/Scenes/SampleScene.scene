@@ -1326,7 +1326,10 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   graphJson: '{"Version":1,"Profiles":[],"Nodes":[]}'
   roadMaterial: {fileID: 2100000, guid: 8bf0c3579df6d0044a6b3669f5e0070a, type: 2}
+  intersectionMaterial: {fileID: 2100000, guid: 9e9b559b717bef24e86d216e51bd1e76,
+    type: 2}
   sagitta: 0.05
+  intersectionCornerRadius: 5
   texturePeriod: 6
 --- !u!4 &2002154949
 Transform:

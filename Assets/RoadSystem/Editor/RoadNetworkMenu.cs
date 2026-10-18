@@ -10,7 +10,8 @@ namespace RoadSystem.EditorTools
     public static class RoadNetworkMenu
     {
         const string MaterialDir = "Assets/RoadSystem/Materials";
-        const string MaterialPath = MaterialDir + "/M_RoadSystem.mat";
+        const string MaterialPath = MaterialDir + "/M_Roads.mat";
+        const string IntersectionMaterialPath = MaterialDir + "/M_Intersection.mat";
         const string TexturePath = "Assets/RoadSystem/Textures/RoadLaneAtlas.png";
         const string InputAssetPath = "Assets/Input/IA_RoadBuilder.inputactions";
         const string InputMapName = "RoadBuilder";
@@ -22,6 +23,10 @@ namespace RoadSystem.EditorTools
             GameObjectUtility.SetParentAndAlign(go, cmd.context as GameObject);
             var net = go.AddComponent<RoadNetworkBehaviour>();
             net.RoadMaterial = GetOrCreateDefaultMaterial();
+            var intersectionMaterial = AssetDatabase.LoadAssetAtPath<Material>(IntersectionMaterialPath);
+            net.IntersectionMaterial = intersectionMaterial;
+            if (intersectionMaterial == null)
+                Debug.LogWarning($"[RoadSystem] 未找到路口材质 {IntersectionMaterialPath}");
             var builder = go.AddComponent<RoadPlayerBuilder>(); // 运行时画路（Play 模式，Input System）
 #if ENABLE_INPUT_SYSTEM
             AssignActionRefs(builder);
@@ -115,7 +120,7 @@ namespace RoadSystem.EditorTools
                 AssetDatabase.CreateFolder("Assets/RoadSystem", "Materials");
 
             var shader = Shader.Find("Universal Render Pipeline/Lit");
-            mat = new Material(shader) { name = "M_RoadSystem" };
+            mat = new Material(shader) { name = "M_Roads" };
             var tex = AssetDatabase.LoadAssetAtPath<Texture2D>(TexturePath);
             if (tex != null) mat.SetTexture("_BaseMap", tex);
             mat.SetFloat("_Smoothness", 0.25f);

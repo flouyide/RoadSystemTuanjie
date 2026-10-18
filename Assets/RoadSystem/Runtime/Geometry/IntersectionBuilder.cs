@@ -31,12 +31,12 @@ namespace RoadSystem.Geometry
         const double MinHalf = 2.0;
         /// <summary>路口中心区域的最小保留长度（米）：两 port 之间至少留出的路面。</summary>
         const double MinGap = 1.0;
-        /// <summary>port 后退的额外余量（米）：backoff = 半宽 + 该值，决定转角圆角半径下限。</summary>
+        /// <summary>port 后退的额外余量（米），叠加在按交角和两条路宽计算的路面交叠距离上。</summary>
         const double CornerMargin = 3.0;
         /// <summary>直行判定阈值（弧度）：|turn| 小于该值按直行配对。</summary>
         const double StraightTurn = Math.PI / 4;
         /// <summary>递归检测深度上限（新段拆分出的半段继续检测穿越）。</summary>
-        const int MaxDetectDepth = 2;
+        const int MaxDetectDepth = 16;
 
         // ================================================================
         // 公共入口
@@ -44,7 +44,7 @@ namespace RoadSystem.Geometry
 
         /// <summary>
         /// 检测新段与全图的交汇并在交点处构建路口（拆分/截断/建 Intersection/配对）。
-        /// 一次调用只建一个路口；拆分出的半段会递归检测（深度限制），覆盖连穿多条路的情形。
+        /// 一次调用可递归建多个路口；拆分出的半段继续检测（深度限制），覆盖连穿多条路的情形。
         /// 返回是否建了路口（图已变更，调用方须 CommitEdit）。
         /// </summary>
         public static bool DetectAndBuild(RoadGraph g, string newSegId, int depth = 0)
@@ -65,7 +65,7 @@ namespace RoadSystem.Geometry
                 if (pathOther == null) continue;
                 if (!BoundsOverlap(pathNew, pathOther)) continue;
 
-                foreach (var hit in IntersectChains(pathNew, pathOther))
+                foreach (var hit in IntersectChains(pathNew, pathOther).OrderBy(h => h.SNew))
                 {
                     var kind = Classify(pathNew, pathOther, hit.SNew, hit.SOther);
                     if (kind == null) continue;
@@ -83,6 +83,164 @@ namespace RoadSystem.Geometry
             if (ports == null || ports.Count == 0) return c;
             foreach (var p in ports) c += p.Position;
             return c / ports.Count;
+        }
+
+        /// <summary>把落在既有路面上的点击点吸附到最近的路段中心线，供建造 T 型路口。</summary>
+        public static bool TrySnapToRoad(RoadGraph g, DVec2 point, double maxDistance,
+            out DVec2 snapped, string excludeRoadId = null)
+        {
+            snapped = point;
+            if (g == null || maxDistance <= 0) return false;
+            double bestDistance = maxDistance;
+            bool found = false;
+            foreach (var segment in g.Segments())
+            {
+                if (!string.IsNullOrEmpty(excludeRoadId) && segment.RoadId == excludeRoadId)
+                    continue;
+                var path = PathOf(g, segment);
+                var start = segment.PortIds.Count > 0 ? g.GetProfile(segment.PortIds[0]) : null;
+                if (path == null || start == null) continue;
+                double snapLimit = Math.Min(maxDistance, start.TotalWidth * 0.5);
+                double along = 0;
+                foreach (var element in path.Elements)
+                {
+                    DVec2 candidate;
+                    if (element is LineElement line)
+                    {
+                        var delta = line.B - line.A;
+                        double t = delta.LengthSquared > 1e-12
+                            ? GeomConsts.Clamp(DVec2.Dot(point - line.A, delta) / delta.LengthSquared, 0, 1)
+                            : 0;
+                        candidate = DVec2.Lerp(line.A, line.B, t);
+                    }
+                    else if (element is ArcElement arc)
+                    {
+                        var radial = (point - arc.Center).Normalized;
+                        candidate = arc.Center + radial * arc.Radius;
+                        if (!ArcIntersections.AngleOnArc(arc, candidate))
+                            candidate = DVec2.Distance(point, arc.StartPoint) < DVec2.Distance(point, arc.EndPoint)
+                                ? arc.StartPoint : arc.EndPoint;
+                    }
+                    else { along += element.Length; continue; }
+
+                    double s = along + ElementParam(element, candidate) * element.Length;
+                    double distance = DVec2.Distance(point, candidate);
+                    if (s > EndpointTol && path.TotalLength - s > EndpointTol
+                        && distance <= snapLimit && distance <= bestDistance)
+                    {
+                        bestDistance = distance;
+                        snapped = candidate;
+                        found = true;
+                    }
+                    along += element.Length;
+                }
+            }
+            return found;
+        }
+
+        /// <summary>
+        /// 放置前检查：在图副本上按正式规则生成路口，确认每个中心线交点都能拆分。
+        /// 不修改原图；普通不相交道路直接通过。
+        /// </summary>
+        public static bool CanBuildRoad(RoadGraph g, Profile start, Profile end,
+            string roadId, out string reason)
+            => CanBuildRoad(g, start, end, roadId, null, out reason);
+
+        public static bool CanBuildRoad(RoadGraph g, Profile start, Profile end,
+            string roadId, PathChain candidatePath, out string reason)
+        {
+            reason = null;
+            if (g == null || start == null || end == null) return false;
+            if (!start.HasSameLayout(end))
+            {
+                reason = "道路两端断面不一致";
+                return false;
+            }
+            var liveStart = g.GetProfile(start.Id);
+            var liveEnd = g.GetProfile(end.Id);
+            if ((liveStart != null && !liveStart.IsLooseEnd)
+                || (liveEnd != null && !liveEnd.IsLooseEnd))
+            {
+                reason = "道路端口已被占用";
+                return false;
+            }
+            var path = candidatePath ?? ProfileConnector.Connect(start, end);
+            if (path == null)
+            {
+                reason = "道路路径无法求解";
+                return false;
+            }
+
+            int expectedIntersections = 0;
+            foreach (var other in g.Segments())
+            {
+                var otherPath = SegmentPathResolver.Resolve(g, other);
+                if (otherPath == null || !BoundsOverlap(path, otherPath)) continue;
+                var hits = IntersectChains(path, otherPath);
+                var seen = new List<DVec2>();
+                foreach (var hit in hits)
+                {
+                    if (seen.Any(p => DVec2.Distance(p, hit.Point) < 1e-4)) continue;
+                    seen.Add(hit.Point);
+                    var kind = Classify(path, otherPath, hit.SNew, hit.SOther);
+                    if (kind == null)
+                    {
+                        // 已有路口/链式接点的端口无法再次作为普通段拆分。
+                        bool atStart = hit.SOther < EndpointTol;
+                        bool atEnd = otherPath.TotalLength - hit.SOther < EndpointTol;
+                        var port = atStart ? g.GetProfile(other.PortIds[0])
+                            : atEnd ? g.GetProfile(other.PortIds[1]) : null;
+                        if (port != null && !port.IsLooseEnd)
+                        {
+                            reason = "交点紧贴已有路口或路段接点";
+                            return false;
+                        }
+                        continue;
+                    }
+                    if (!string.IsNullOrEmpty(roadId) && other.RoadId == roadId)
+                    {
+                        reason = "同一条道路内部相交";
+                        return false;
+                    }
+                    expectedIntersections++;
+                }
+            }
+            if (expectedIntersections == 0) return true;
+
+            // 与正式建口共用 DetectAndBuild，能覆盖连续交叉后半段变短等情况。
+            var copy = RoadGraphMapper.FromDto(RoadGraphMapper.ToDto(g));
+            foreach (var source in g.Segments())
+                if (copy.GetNode(source.Id) is RoadSegment copied) copied.Path = source.Path;
+            Profile CopyEndpoint(Profile source)
+            {
+                var existing = copy.GetProfile(source.Id);
+                if (existing != null)
+                {
+                    if (!existing.Position.ApproxEquals(source.Position)
+                        || !existing.Direction.ApproxEquals(source.Direction))
+                        copy.MoveProfile(existing, source.Position, source.Direction);
+                    return existing;
+                }
+                var created = copy.CreateProfile(source.Position, source.Direction, source.Lanes);
+                created.Y = source.Y;
+                return created;
+            }
+            var a = CopyEndpoint(start);
+            var b = CopyEndpoint(end);
+            var candidate = copy.AddSegment(a, b, roadId);
+            if (candidate == null)
+            {
+                reason = "道路端口无法连接";
+                return false;
+            }
+            candidate.Path = path;
+            if (candidatePath != null) candidate.ExplicitPath = SegmentPathResolver.Store(path);
+            int before = copy.Nodes.Values.Count(n => n is Intersection);
+            DetectAndBuild(copy, candidate.Id);
+            int built = copy.Nodes.Values.Count(n => n is Intersection) - before;
+            if (built == expectedIntersections) return true;
+            reason = "交点距离路段端点或已有路口过近，无法留出路口空间";
+            return false;
         }
 
         // ================================================================
@@ -169,6 +327,8 @@ namespace RoadSystem.Geometry
                 double theta = Math.Atan2(p.Y - arc.Center.Y, p.X - arc.Center.X);
                 double rel = ArcIntersections.NormalizeAngle(theta - arc.StartAngle); // (-π, π]
                 if (Math.Abs(arc.Sweep) < 1e-12) return 0;
+                if (arc.Sweep > 0 && rel < 0) rel += 2 * Math.PI;
+                if (arc.Sweep < 0 && rel > 0) rel -= 2 * Math.PI;
                 return GeomConsts.Clamp(rel / arc.Sweep, 0, 1);
             }
             return 0;
@@ -197,34 +357,51 @@ namespace RoadSystem.Geometry
             var pathOther = PathOf(g, segOther);
             if (pathNew == null || pathOther == null) return false;
 
-            // 可拆性预检（避免拆了一半另一段拆不动，留下断路）
-            if (!CanSplitAt(pathOther, sOther, g, segOther)) return false;
-            if (kind == CrossKind.Interior && !CanSplitAt(pathNew, sNew, g, segNew)) return false;
+            // 斜交时，路面边缘的交点离中心更远；两条路使用同一后退量以避免相互覆盖。
+            if (!PathChainUtil.PointAt(pathNew, sNew, out _, out var newTangent)
+                || !PathChainUtil.PointAt(pathOther, sOther, out _, out var otherTangent)) return false;
+            double sinAngle = Math.Abs(DVec2.Cross(newTangent, otherTangent));
+            if (sinAngle < 0.1) return false;
+            var newStart = g.GetProfile(segNew.PortIds[0]);
+            var otherStart = g.GetProfile(segOther.PortIds[0]);
+            if (newStart == null || otherStart == null) return false;
+            double backoff = (newStart.TotalWidth + otherStart.TotalWidth) * 0.5 / sinAngle + CornerMargin;
+
+            // 所有操作预检后才修改图，防止单边拆分留下断路。
+            if (!CanSplitAt(pathOther, sOther, backoff)) return false;
+            if (kind == CrossKind.Interior && !CanSplitAt(pathNew, sNew, backoff)) return false;
+            if (kind != CrossKind.Interior)
+            {
+                var end = g.GetProfile(segNew.PortIds[kind == CrossKind.TeeAtNewEnd ? 1 : 0]);
+                if (end == null || IsSharedByOther(end, segNew.Id)) return false;
+                if (kind == CrossKind.TeeAtNewEnd && sNew - backoff < MinHalf) return false;
+                if (kind == CrossKind.TeeAtNewStart && pathNew.TotalLength - sNew - backoff < MinHalf) return false;
+            }
 
             // 1. 拆分被穿越的既有段 → 两个 port（流出半段终点 + 流入半段起点）
-            if (!SplitInterior(g, segOther, pathOther, sOther,
+            if (!SplitInterior(g, segOther, pathOther, sOther, backoff,
                 out var aOut, out var aIn, out _, out _))
                 return false;
 
             // 2. 新段处理
             var ports = new List<Profile> { aOut, aIn };
+            string leftId = null;
             string rightHalfId = null;
             if (kind == CrossKind.Interior)
             {
-                if (!SplitInterior(g, segNew, pathNew, sNew,
-                    out var bOut, out var bIn, out var leftId, out rightHalfId))
+                if (!SplitInterior(g, segNew, pathNew, sNew, backoff,
+                    out var bOut, out var bIn, out leftId, out rightHalfId))
                     return false;
                 ports.Add(bOut);
                 ports.Add(bIn);
-                if (leftId != null) DetectAndBuild(g, leftId, depth + 1); // 左半段也可能穿越
             }
             else if (kind == CrossKind.TeeAtNewEnd)
             {
-                ports.Add(TruncateEnd(g, segNew, pathNew, sNew));
+                ports.Add(TruncateEnd(g, segNew, pathNew, sNew, backoff));
             }
             else
             {
-                ports.Add(TruncateStart(g, segNew, pathNew, sNew));
+                ports.Add(TruncateStart(g, segNew, pathNew, sNew, backoff));
             }
 
             // 3. 创建 Intersection 节点并挂接 ports
@@ -258,6 +435,7 @@ namespace RoadSystem.Geometry
             g.NotifyChanged(affected);
 
             // 6. 新段右半段（含原终点侧）继续检测：一条路连穿多条路的情形
+            if (kind == CrossKind.Interior && leftId != null) DetectAndBuild(g, leftId, depth + 1);
             if (rightHalfId != null) DetectAndBuild(g, rightHalfId, depth + 1);
             return true;
         }
@@ -265,32 +443,22 @@ namespace RoadSystem.Geometry
         /// <summary>段的 path（优先缓存，缺则现场解算并缓存）。</summary>
         static PathChain PathOf(RoadGraph g, RoadSegment seg)
         {
-            if (seg.Path != null) return seg.Path;
-            if (seg.PortIds.Count != 2) return null;
-            var pa = g.GetProfile(seg.PortIds[0]);
-            var pb = g.GetProfile(seg.PortIds[1]);
-            if (pa == null || pb == null) return null;
-            seg.Path = ProfileConnector.Connect(pa, pb);
-            return seg.Path;
+            return SegmentPathResolver.Resolve(g, seg);
         }
 
         /// <summary>拆分预检：交点两侧留足半段最小长度与路口中心保留区。</summary>
-        static bool CanSplitAt(PathChain path, double s, RoadGraph g, RoadSegment seg)
+        static bool CanSplitAt(PathChain path, double s, double backoff)
         {
             double L = path.TotalLength;
-            var pa = g.GetProfile(seg.PortIds[0]);
-            if (pa == null) return false;
-            double backoff = pa.TotalWidth * 0.5 + CornerMargin;
-            double sL = GeomConsts.Clamp(s - backoff, MinHalf, s);
-            double sR = GeomConsts.Clamp(s + backoff, s, L - MinHalf);
-            return sL >= MinHalf - 1e-6 && L - sR >= MinHalf - 1e-6 && sR - sL >= MinGap;
+            return s - backoff >= MinHalf && L - s - backoff >= MinHalf
+                   && backoff * 2 >= MinGap;
         }
 
         /// <summary>
         /// 内部拆分：交点 s 两侧各后退 backoff 生成两个 port profile（流出+流入），
         /// 原段删除、生成左右两半段（继承 RoadId 与 path 子段缓存）。
         /// </summary>
-        static bool SplitInterior(RoadGraph g, RoadSegment seg, PathChain path, double s,
+        static bool SplitInterior(RoadGraph g, RoadSegment seg, PathChain path, double s, double backoff,
             out Profile portOut, out Profile portIn, out string leftId, out string rightId)
         {
             portOut = null; portIn = null; leftId = null; rightId = null;
@@ -300,9 +468,8 @@ namespace RoadSystem.Geometry
             if (pa == null || pb == null) return false;
 
             double L = path.TotalLength;
-            double backoff = pa.TotalWidth * 0.5 + CornerMargin;
-            double sL = GeomConsts.Clamp(s - backoff, MinHalf, s);
-            double sR = GeomConsts.Clamp(s + backoff, s, L - MinHalf);
+            double sL = s - backoff;
+            double sR = s + backoff;
             if (sL < MinHalf - 1e-6 || L - sR < MinHalf - 1e-6 || sR - sL < MinGap)
                 return false;
 
@@ -322,6 +489,8 @@ namespace RoadSystem.Geometry
             if (left == null || right == null) return false;
             left.Path = PathChainUtil.SubPath(path, 0, sL);
             right.Path = PathChainUtil.SubPath(path, sR, L);
+            left.ExplicitPath = SegmentPathResolver.Store(left.Path);
+            right.ExplicitPath = SegmentPathResolver.Store(right.Path);
             leftId = left.Id;
             rightId = right.Id;
             return true;
@@ -329,9 +498,9 @@ namespace RoadSystem.Geometry
 
         /// <summary>
         /// T 型终点截断：新段终点 port 沿 path 后退 backoff 到路口边界。
-        /// 终点 profile 为悬空端（本建造流程新建）时移动之；被共享或距离不足则原位作为 port。
+        /// 终点 profile 已在 BuildOne 中预检为悬空且长度足够；移动到路口边界。
         /// </summary>
-        static Profile TruncateEnd(RoadGraph g, RoadSegment seg, PathChain path, double s)
+        static Profile TruncateEnd(RoadGraph g, RoadSegment seg, PathChain path, double s, double backoff)
         {
             if (seg.PortIds.Count != 2) return null;
             var pa = g.GetProfile(seg.PortIds[0]);
@@ -339,8 +508,7 @@ namespace RoadSystem.Geometry
             if (pa == null || pb == null) return null;
 
             double L = path.TotalLength;
-            double backoff = pa.TotalWidth * 0.5 + CornerMargin;
-            double sN = GeomConsts.Clamp(s - backoff, MinHalf, L);
+            double sN = s - backoff;
             if (L - sN < MinGap) return pb; // 终点距交点太近：port 即终点原位
             if (IsSharedByOther(pb, seg.Id)) return pb;
 
@@ -348,11 +516,12 @@ namespace RoadSystem.Geometry
             g.MoveProfile(pb, pos, tan);
             pb.Y = (float)(pa.Y + (pb.Y - pa.Y) * (sN / L));
             seg.Path = PathChainUtil.SubPath(path, 0, sN);
+            seg.ExplicitPath = SegmentPathResolver.Store(seg.Path);
             return pb;
         }
 
         /// <summary>T 型起点截断：与 TruncateEnd 对称（起点 port 后退）。</summary>
-        static Profile TruncateStart(RoadGraph g, RoadSegment seg, PathChain path, double s)
+        static Profile TruncateStart(RoadGraph g, RoadSegment seg, PathChain path, double s, double backoff)
         {
             if (seg.PortIds.Count != 2) return null;
             var pa = g.GetProfile(seg.PortIds[0]);
@@ -360,8 +529,7 @@ namespace RoadSystem.Geometry
             if (pa == null || pb == null) return null;
 
             double L = path.TotalLength;
-            double backoff = pa.TotalWidth * 0.5 + CornerMargin;
-            double sN = GeomConsts.Clamp(s + backoff, 0, L - MinHalf);
+            double sN = s + backoff;
             if (sN < MinGap) return pa;
             if (IsSharedByOther(pa, seg.Id)) return pa;
 
@@ -369,6 +537,7 @@ namespace RoadSystem.Geometry
             g.MoveProfile(pa, pos, tan);
             pa.Y = (float)(pa.Y + (pb.Y - pa.Y) * (sN / L));
             seg.Path = PathChainUtil.SubPath(path, sN, L);
+            seg.ExplicitPath = SegmentPathResolver.Store(seg.Path);
             return pa;
         }
 
@@ -401,9 +570,8 @@ namespace RoadSystem.Geometry
         // ================================================================
 
         /// <summary>
-        /// 生成默认车道连接：from = 流入 port（Direction 指向路口中心），to = 流出 port。
-        /// 转角 turn = signedAngle(from.Direction, to.Direction)：
-        /// |turn| &lt; 45° 直行（每条 Car 车道按同序号配对）；turn &gt; 0 左转（最左↔最左）；turn &lt; 0 右转（最右↔最右）。
+        /// 逐车道判断流入/流出；双向 profile 的 Forward=false 车道沿 -Direction 行驶。
+        /// 直行选择角度最小的出口，左转取行驶方向最左车道，右转取最右车道。
         /// 配对显式写入 LaneLinks；Path 走 ProfileConnector 解算（缓存，暂不渲染）。
         /// </summary>
         public static void BuildLaneLinks(RoadGraph g, Intersection ix)
@@ -412,50 +580,70 @@ namespace RoadSystem.Geometry
             var ports = LivePorts(g, ix);
             if (ports.Count < 3) return;
             var center = CenterOf(ports);
-            var inflow = new List<Profile>();
-            var outflow = new List<Profile>();
-            foreach (var p in ports)
-                (DVec2.Dot(p.Direction, center - p.Position) > 0 ? inflow : outflow).Add(p);
-            if (inflow.Count == 0 || outflow.Count == 0) return;
-
-            foreach (var from in inflow)
-            foreach (var to in outflow)
+            foreach (var from in ports)
             {
-                double turn = ArcIntersections.NormalizeAngle(Math.Atan2(
-                    DVec2.Cross(from.Direction, to.Direction), DVec2.Dot(from.Direction, to.Direction)));
-                if (Math.Abs(turn) < StraightTurn) ConnectStraight(g, ix, from, to);
-                else ConnectTurn(g, ix, from, to, leftmost: turn > 0);
+                var incoming = CarIndices(from, center, true);
+                if (incoming.Count == 0) continue;
+                var inDirection = TravelDirection(from, incoming[0]);
+                Profile straight = null;
+                double bestAngle = StraightTurn;
+                foreach (var to in ports)
+                {
+                    if (to == from) continue;
+                    var outgoing = CarIndices(to, center, false);
+                    if (outgoing.Count == 0) continue;
+                    double angle = Math.Abs(TurnAngle(inDirection, TravelDirection(to, outgoing[0])));
+                    if (angle < bestAngle) { bestAngle = angle; straight = to; }
+                }
+                if (straight != null) ConnectStraight(ix, from, incoming, straight, CarIndices(straight, center, false));
+
+                foreach (var to in ports)
+                {
+                    if (to == from || to == straight) continue;
+                    var outgoing = CarIndices(to, center, false);
+                    if (outgoing.Count == 0) continue;
+                    double turn = TurnAngle(inDirection, TravelDirection(to, outgoing[0]));
+                    if (Math.Abs(turn) > Math.PI * 0.9) continue; // 不自动生成掉头
+                    ConnectTurn(ix, from, incoming, to, outgoing, turn > 0);
+                }
             }
         }
 
-        static void ConnectStraight(RoadGraph g, Intersection ix, Profile from, Profile to)
+        static double TurnAngle(DVec2 a, DVec2 b)
+            => ArcIntersections.NormalizeAngle(Math.Atan2(DVec2.Cross(a, b), DVec2.Dot(a, b)));
+
+        static DVec2 TravelDirection(Profile p, int lane)
+            => p.Lanes[lane].Forward ? p.Direction : -p.Direction;
+
+        static void ConnectStraight(Intersection ix, Profile from, List<int> fromCar, Profile to, List<int> toCar)
         {
-            var fromCar = CarIndices(from);
-            var toCar = CarIndices(to);
             for (int m = 0; m < fromCar.Count && m < toCar.Count; m++)
-                AddLink(g, ix, from, fromCar[m], to, toCar[m]);
+                AddLink(ix, from, fromCar[m], to, toCar[m]);
         }
 
-        static void ConnectTurn(RoadGraph g, Intersection ix, Profile from, Profile to, bool leftmost)
+        static void ConnectTurn(Intersection ix, Profile from, List<int> fromCar,
+            Profile to, List<int> toCar, bool leftmost)
         {
-            var fromCar = CarIndices(from);
-            var toCar = CarIndices(to);
             if (fromCar.Count == 0 || toCar.Count == 0) return;
             int fk = leftmost ? fromCar[0] : fromCar[fromCar.Count - 1];
             int tk = leftmost ? toCar[0] : toCar[toCar.Count - 1];
-            AddLink(g, ix, from, fk, to, tk);
+            AddLink(ix, from, fk, to, tk);
         }
 
-        static List<int> CarIndices(Profile p)
+        static List<int> CarIndices(Profile p, DVec2 center, bool incoming)
         {
             var list = new List<int>();
             if (p.Lanes == null) return list;
             for (int i = 0; i < p.Lanes.Length; i++)
-                if (p.Lanes[i].Type == LaneType.Car) list.Add(i);
+                if (p.Lanes[i].Type == LaneType.Car
+                    && (DVec2.Dot(TravelDirection(p, i), center - p.Position) > 0) == incoming)
+                    list.Add(i);
+            // Lanes[] 是相对 profile.Direction 从左到右；逆向行车要反序。
+            if (list.Count > 0 && !p.Lanes[list[0]].Forward) list.Reverse();
             return list;
         }
 
-        static void AddLink(RoadGraph g, Intersection ix, Profile from, int fromLane, Profile to, int toLane)
+        static void AddLink(Intersection ix, Profile from, int fromLane, Profile to, int toLane)
         {
             var link = new LaneConnection
             {
@@ -464,13 +652,32 @@ namespace RoadSystem.Geometry
                 FromLane = fromLane,
                 ToLane = toLane
             };
-            // 车道中心间的转向路径（缓存解算，MVP 不渲染箭头）
+            link.Path = SolveLanePath(from, fromLane, to, toLane);
+            ix.LaneLinks.Add(link);
+        }
+
+        /// <summary>反序列化后恢复显式连接的几何缓存，不改变已经存储的配对意图。</summary>
+        public static void RefreshLanePaths(RoadGraph g, Intersection ix)
+        {
+            foreach (var link in ix.LaneLinks)
+            {
+                var from = g.GetProfile(link.FromPortId);
+                var to = g.GetProfile(link.ToPortId);
+                link.Path = from != null && to != null && from.Lanes != null && to.Lanes != null
+                    && link.FromLane >= 0 && link.FromLane < from.Lanes.Length
+                    && link.ToLane >= 0 && link.ToLane < to.Lanes.Length
+                    ? SolveLanePath(from, link.FromLane, to, link.ToLane) : null;
+            }
+        }
+
+        static PathChain SolveLanePath(Profile from, int fromLane, Profile to, int toLane)
+        {
             var bFrom = from.BoundaryOffsets();
             var bTo = to.BoundaryOffsets();
             DVec2 a = from.LateralPoint(bFrom[fromLane] + from.Lanes[fromLane].Width * 0.5);
             DVec2 b = to.LateralPoint(bTo[toLane] + to.Lanes[toLane].Width * 0.5);
-            link.Path = ProfileConnector.ConnectCenters(a, from.Direction, b, to.Direction, 0);
-            ix.LaneLinks.Add(link);
+            return ProfileConnector.ConnectCenters(a, TravelDirection(from, fromLane),
+                b, TravelDirection(to, toLane), 0);
         }
 
         // ================================================================
@@ -480,12 +687,15 @@ namespace RoadSystem.Geometry
         /// <summary>
         /// 构建路口边界环：ports 按绕中心极角排序（数学 CCW），
         /// 每个 port 贡献一条截面边（CW 端 → CCW 端），相邻 port 的相邻外缘端点间
-        /// 用两线 fillet（Fillet.Solve，圆角半径由 port 后退距离自然决定）构造转角弧。
+        /// 用与两侧道路外缘相切的直线-圆弧-直线 fillet 构造转角。
+        /// intersectionCurve 为 0 时保持圆角，1 时变为两端点之间的直边。
         /// 环顶点带高度（port.Y 线性插值）。失败返回 null。
         /// </summary>
-        public static List<BoundaryVertex> BuildBoundaryLoop(List<Profile> ports, DVec2 center, double sagitta)
+        public static List<BoundaryVertex> BuildBoundaryLoop(List<Profile> ports, DVec2 center,
+            double sagitta, double cornerRadius = 5.0, double intersectionCurve = 0.0)
         {
             if (ports == null || ports.Count < 3) return null;
+            intersectionCurve = Math.Max(0.0, Math.Min(1.0, intersectionCurve));
             var sorted = ports
                 .OrderBy(p => Math.Atan2(p.Position.Y - center.Y, p.Position.X - center.X))
                 .ToList();
@@ -516,12 +726,26 @@ namespace RoadSystem.Geometry
             for (int i = 0; i < n; i++)
             {
                 int j = (i + 1) % n;
-                // 转角：port i 的 CCW 外缘端 → port j 的 CW 外缘端（两线 fillet，平行兜底直线）
-                var corner = CornerPath(sorted[i], ccw[i], sorted[j], cw[j], center);
+                // 转角：port i 的 CCW 外缘端 → port j 的 CW 外缘端。
                 double yFrom = sorted[i].Y, yTo = sorted[j].Y;
-                double cornerLen = corner.TotalLength;
-                foreach (var pt in PathSampler.Sample(corner, sagitta))
-                    AddPt(pt.Position, yFrom + (yTo - yFrom) * (cornerLen > 1e-6 ? pt.ArcLength / cornerLen : 0));
+                if (intersectionCurve >= 1.0)
+                {
+                    AddPt(ccw[i], yFrom);
+                    AddPt(cw[j], yTo);
+                }
+                else
+                {
+                    var corner = BuildCornerPath(sorted[i], ccw[i], sorted[j], cw[j], cornerRadius);
+                    double cornerLen = corner.TotalLength;
+                    foreach (var pt in PathSampler.Sample(corner, sagitta))
+                    {
+                        double t = cornerLen > 1e-6 ? pt.ArcLength / cornerLen : 0;
+                        var pos = intersectionCurve > 0.0
+                            ? DVec2.Lerp(pt.Position, DVec2.Lerp(ccw[i], cw[j], t), intersectionCurve)
+                            : pt.Position;
+                        AddPt(pos, yFrom + (yTo - yFrom) * t);
+                    }
+                }
 
                 // port j 截面边：CW 端 → CCW 端
                 AddPt(cw[j], sorted[j].Y);
@@ -535,14 +759,12 @@ namespace RoadSystem.Geometry
         }
 
         /// <summary>
-        /// 两外缘线间的转角路径：过两 port 外缘端点、沿各自 Direction 的直线求交 C，
-        /// 以 (C−E1) / (E2−C) 为 fillet 切向解 Arc+Line（切点即端点，圆角半径 = min(CA, CB)）。
-        /// 例外兜底（均退化为直线 E1→E2）：
-        ///  · 外缘线平行；
-        ///  · C 与路口中心落在弦 E1E2 的同侧 —— 此时圆角弧凹向路口中心（斜交钝角侧），
-        ///    会把边界环变成非星形、破坏中心辐射三角化，改为直边转角。
+        /// 两外缘线交于 C。沿两边各退 r*tan(|turn|/2) 得切点，
+        /// 生成 Line(E1,T1) + Arc(T1,T2) + Line(T2,E2)。
+        /// 半径按两侧可用边长缩小；近乎平行、反向或空间不足时退化为直边。
         /// </summary>
-        static PathChain CornerPath(Profile pi, DVec2 e1, Profile pj, DVec2 e2, DVec2 center)
+        public static PathChain BuildCornerPath(Profile pi, DVec2 e1, Profile pj, DVec2 e2,
+            double radius)
         {
             DVec2 d1 = pi.Direction, d2 = pj.Direction;
             double denom = DVec2.Cross(d1, d2);
@@ -551,17 +773,34 @@ namespace RoadSystem.Geometry
 
             double t = DVec2.Cross(e2 - e1, d2) / denom;
             DVec2 c = e1 + d1 * t;
-            DVec2 dA = c - e1, dB = e2 - c;
-            if (dA.Length < GeomConsts.DistEps || dB.Length < GeomConsts.DistEps)
+            DVec2 first = c - e1, second = e2 - c;
+            double firstLength = first.Length, secondLength = second.Length;
+            if (firstLength < GeomConsts.DistEps || secondLength < GeomConsts.DistEps)
                 return Straight(e1, e2);
 
-            // C 应在转角尖端（比弦 E1E2 更远离中心的一侧）；与中心同侧 → 内凹弧，退化为直线
-            double sideC = DVec2.Cross(e2 - e1, c - e1);
-            double sideO = DVec2.Cross(e2 - e1, center - e1);
-            if (Math.Sign(sideC) == Math.Sign(sideO) && Math.Abs(sideO) > 1e-9)
+            DVec2 u = first / firstLength, v = second / secondLength;
+            double turn = Math.Atan2(DVec2.Cross(u, v), DVec2.Dot(u, v));
+            double halfTangent = Math.Tan(Math.Abs(turn) * 0.5);
+            if (Math.Abs(turn) < 1e-3 || Math.Abs(turn) > Math.PI - 1e-3
+                || halfTangent < 1e-6 || radius <= 0)
                 return Straight(e1, e2);
 
-            return Fillet.Solve(e1, dA.Normalized, e2, dB.Normalized) ?? Straight(e1, e2);
+            // 留出少量直边，使圆弧不直接贴到 port 截面；短边优先缩小半径。
+            double fittedRadius = Math.Min(radius,
+                0.9 * Math.Min(firstLength, secondLength) / halfTangent);
+            if (fittedRadius < GeomConsts.MinRadius) return Straight(e1, e2);
+
+            double tangentLength = fittedRadius * halfTangent;
+            DVec2 t1 = c - u * tangentLength;
+            DVec2 t2 = c + v * tangentLength;
+            double turnSign = Math.Sign(turn);
+            DVec2 circleCenter = t1 + u.PerpLeft * (turnSign * fittedRadius);
+            double startAngle = Math.Atan2(t1.Y - circleCenter.Y, t1.X - circleCenter.X);
+            var chain = new PathChain();
+            chain.Add(new LineElement(e1, t1));
+            chain.Add(new ArcElement(circleCenter, fittedRadius, startAngle, turn));
+            chain.Add(new LineElement(t2, e2));
+            return chain;
         }
 
         static PathChain Straight(DVec2 a, DVec2 b)
