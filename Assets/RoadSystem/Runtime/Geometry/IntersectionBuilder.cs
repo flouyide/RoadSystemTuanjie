@@ -149,98 +149,8 @@ namespace RoadSystem.Geometry
         public static bool CanBuildRoad(RoadGraph g, Profile start, Profile end,
             string roadId, PathChain candidatePath, out string reason)
         {
-            reason = null;
-            if (g == null || start == null || end == null) return false;
-            if (!start.HasSameLayout(end))
-            {
-                reason = "道路两端断面不一致";
-                return false;
-            }
-            var liveStart = g.GetProfile(start.Id);
-            var liveEnd = g.GetProfile(end.Id);
-            if ((liveStart != null && !liveStart.IsLooseEnd)
-                || (liveEnd != null && !liveEnd.IsLooseEnd))
-            {
-                reason = "道路端口已被占用";
-                return false;
-            }
-            var path = candidatePath ?? ProfileConnector.Connect(start, end);
-            if (path == null)
-            {
-                reason = "道路路径无法求解";
-                return false;
-            }
-
-            int expectedIntersections = 0;
-            foreach (var other in g.Segments())
-            {
-                var otherPath = SegmentPathResolver.Resolve(g, other);
-                if (otherPath == null || !BoundsOverlap(path, otherPath)) continue;
-                var hits = IntersectChains(path, otherPath);
-                var seen = new List<DVec2>();
-                foreach (var hit in hits)
-                {
-                    if (seen.Any(p => DVec2.Distance(p, hit.Point) < 1e-4)) continue;
-                    seen.Add(hit.Point);
-                    var kind = Classify(path, otherPath, hit.SNew, hit.SOther);
-                    if (kind == null)
-                    {
-                        // 已有路口/链式接点的端口无法再次作为普通段拆分。
-                        bool atStart = hit.SOther < EndpointTol;
-                        bool atEnd = otherPath.TotalLength - hit.SOther < EndpointTol;
-                        var port = atStart ? g.GetProfile(other.PortIds[0])
-                            : atEnd ? g.GetProfile(other.PortIds[1]) : null;
-                        if (port != null && !port.IsLooseEnd)
-                        {
-                            reason = "交点紧贴已有路口或路段接点";
-                            return false;
-                        }
-                        continue;
-                    }
-                    if (!string.IsNullOrEmpty(roadId) && other.RoadId == roadId)
-                    {
-                        reason = "同一条道路内部相交";
-                        return false;
-                    }
-                    expectedIntersections++;
-                }
-            }
-            if (expectedIntersections == 0) return true;
-
-            // 与正式建口共用 DetectAndBuild，能覆盖连续交叉后半段变短等情况。
-            var copy = RoadGraphMapper.FromDto(RoadGraphMapper.ToDto(g));
-            foreach (var source in g.Segments())
-                if (copy.GetNode(source.Id) is RoadSegment copied) copied.Path = source.Path;
-            Profile CopyEndpoint(Profile source)
-            {
-                var existing = copy.GetProfile(source.Id);
-                if (existing != null)
-                {
-                    if (!existing.Position.ApproxEquals(source.Position)
-                        || !existing.Direction.ApproxEquals(source.Direction))
-                        copy.MoveProfile(existing, source.Position, source.Direction);
-                    return existing;
-                }
-                var created = copy.CreateProfile(source.Position, source.Direction, source.Lanes);
-                created.Y = source.Y;
-                return created;
-            }
-            var a = CopyEndpoint(start);
-            var b = CopyEndpoint(end);
-            var candidate = copy.AddSegment(a, b, roadId);
-            if (candidate == null)
-            {
-                reason = "道路端口无法连接";
-                return false;
-            }
-            candidate.Path = path;
-            if (candidatePath != null) candidate.ExplicitPath = SegmentPathResolver.Store(path);
-            int before = copy.Nodes.Values.Count(n => n is Intersection);
-            DetectAndBuild(copy, candidate.Id);
-            int built = copy.Nodes.Values.Count(n => n is Intersection) - before;
-            if (built == expectedIntersections) return true;
-            reason = "交点距离路段端点或已有路口过近，无法留出路口空间";
-            return false;
+            return RoadBuildPlanner.TryPlan(g, start, end, candidatePath, roadId, null, null,
+                RoadBuildSettings.Default, out _, out reason);
         }
 
         // ================================================================
@@ -405,7 +315,8 @@ namespace RoadSystem.Geometry
             }
 
             // 3. 创建 Intersection 节点并挂接 ports
-            var ix = new Intersection();
+            PathChainUtil.PointAt(pathNew, sNew, out var anchor, out _);
+            var ix = new Intersection { HasAnchor = true, Anchor = anchor, AnchorY = newStart.Y };
             g.Nodes[ix.Id] = ix;
             foreach (var p in ports)
             {
@@ -579,10 +490,9 @@ namespace RoadSystem.Geometry
             ix.LaneLinks.Clear();
             var ports = LivePorts(g, ix);
             if (ports.Count < 3) return;
-            var center = CenterOf(ports);
             foreach (var from in ports)
             {
-                var incoming = CarIndices(from, center, true);
+                var incoming = CarIndices(g, ix, from, true);
                 if (incoming.Count == 0) continue;
                 var inDirection = TravelDirection(from, incoming[0]);
                 Profile straight = null;
@@ -590,17 +500,17 @@ namespace RoadSystem.Geometry
                 foreach (var to in ports)
                 {
                     if (to == from) continue;
-                    var outgoing = CarIndices(to, center, false);
+                    var outgoing = CarIndices(g, ix, to, false);
                     if (outgoing.Count == 0) continue;
                     double angle = Math.Abs(TurnAngle(inDirection, TravelDirection(to, outgoing[0])));
                     if (angle < bestAngle) { bestAngle = angle; straight = to; }
                 }
-                if (straight != null) ConnectStraight(ix, from, incoming, straight, CarIndices(straight, center, false));
+                if (straight != null) ConnectStraight(ix, from, incoming, straight, CarIndices(g, ix, straight, false));
 
                 foreach (var to in ports)
                 {
                     if (to == from || to == straight) continue;
-                    var outgoing = CarIndices(to, center, false);
+                    var outgoing = CarIndices(g, ix, to, false);
                     if (outgoing.Count == 0) continue;
                     double turn = TurnAngle(inDirection, TravelDirection(to, outgoing[0]));
                     if (Math.Abs(turn) > Math.PI * 0.9) continue; // 不自动生成掉头
@@ -630,13 +540,16 @@ namespace RoadSystem.Geometry
             AddLink(ix, from, fk, to, tk);
         }
 
-        static List<int> CarIndices(Profile p, DVec2 center, bool incoming)
+        static List<int> CarIndices(RoadGraph g, Intersection ix, Profile p, bool incoming)
         {
             var list = new List<int>();
             if (p.Lanes == null) return list;
+            var segment = g.GetNode(OtherNode(p, ix.Id)) as RoadSegment;
+            if (segment == null || segment.PortIds.Count != 2) return list;
+            bool atEnd = segment.PortIds[1] == p.Id;
             for (int i = 0; i < p.Lanes.Length; i++)
                 if (p.Lanes[i].Type == LaneType.Car
-                    && (DVec2.Dot(TravelDirection(p, i), center - p.Position) > 0) == incoming)
+                    && (p.Lanes[i].Forward == atEnd) == incoming)
                     list.Add(i);
             // Lanes[] 是相对 profile.Direction 从左到右；逆向行车要反序。
             if (list.Count > 0 && !p.Lanes[list[0]].Forward) list.Reverse();

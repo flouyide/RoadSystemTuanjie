@@ -43,6 +43,9 @@ namespace RoadSystem.Core
     /// </summary>
     public sealed class Intersection : RoadNodeBase
     {
+        public bool HasAnchor;
+        public DVec2 Anchor;
+        public float AnchorY;
         /// <summary>显式车道级连接（意图显式存储，不靠推断）。</summary>
         public List<LaneConnection> LaneLinks = new List<LaneConnection>();
     }

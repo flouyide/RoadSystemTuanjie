@@ -44,6 +44,9 @@ namespace RoadSystem.Core
     [Serializable]
     public class NodeDto
     {
+        public bool HasAnchor;
+        public DVec2 Anchor;
+        public float AnchorY;
         /// <summary>节点唯一标识（Guid 字符串）。</summary>
         public string Id;
         /// <summary>节点类型标记："segment"（路段）或 "intersection"（路口），反序列化时据此重建具体类型。</summary>
@@ -62,8 +65,8 @@ namespace RoadSystem.Core
     [Serializable]
     public class RoadGraphDto
     {
-        /// <summary>版本 2 增加可选的显式直线/圆弧路径；旧数据仍按端点求解。</summary>
-        public int Version = 2;
+        /// <summary>版本 3 增加稳定路口锚点；兼容旧版显式路径及无锚点数据。</summary>
+        public int Version = 3;
         /// <summary>所有 Profile（端点）的扁平列表，对应 RoadGraph.Profiles 字典。</summary>
         public List<ProfileDto> Profiles = new List<ProfileDto>();
         /// <summary>所有节点（路段/路口）的扁平列表，对应 RoadGraph.Nodes 字典。</summary>
@@ -87,7 +90,7 @@ namespace RoadSystem.Core
                     Id = p.Id,
                     Position = p.Position,
                     Direction = p.Direction,
-                    Lanes = p.Lanes,
+                    Lanes = p.Lanes == null ? null : (LaneDef[])p.Lanes.Clone(),
                     Y = p.Y,
                     NodeAId = p.NodeAId,
                     NodeBId = p.NodeBId
@@ -99,14 +102,17 @@ namespace RoadSystem.Core
                 if (n is Intersection ix)
                 {
                     nd.Kind = "intersection";
-                    nd.LaneLinks = new List<LaneConnection>(ix.LaneLinks);
+                    nd.LaneLinks = CopyLinks(ix.LaneLinks);
+                    nd.HasAnchor = ix.HasAnchor;
+                    nd.Anchor = ix.Anchor;
+                    nd.AnchorY = ix.AnchorY;
                 }
                 else
                 {
                     nd.Kind = "segment";
                     var segment = (RoadSegment)n;
                     nd.RoadId = segment.RoadId;
-                    nd.ExplicitPath = segment.ExplicitPath;
+                    nd.ExplicitPath = CopyPath(segment.ExplicitPath);
                 }
                 dto.Nodes.Add(nd);
             }
@@ -129,7 +135,7 @@ namespace RoadSystem.Core
                     Id = pd.Id,
                     Position = pd.Position,
                     Direction = pd.Direction,
-                    Lanes = pd.Lanes,
+                    Lanes = pd.Lanes == null ? null : (LaneDef[])pd.Lanes.Clone(),
                     Y = pd.Y,
                     NodeAId = pd.NodeAId,
                     NodeBId = pd.NodeBId
@@ -141,18 +147,38 @@ namespace RoadSystem.Core
                 RoadNodeBase n;
                 if (nd.Kind == "intersection")
                 {
-                    n = new Intersection { LaneLinks = nd.LaneLinks ?? new List<LaneConnection>() };
+                    n = new Intersection { LaneLinks = CopyLinks(nd.LaneLinks),
+                        HasAnchor = nd.HasAnchor, Anchor = nd.Anchor, AnchorY = nd.AnchorY };
                 }
                 else
                 {
-                    var seg = new RoadSegment { RoadId = nd.RoadId, ExplicitPath = nd.ExplicitPath };
+                    var seg = new RoadSegment { RoadId = nd.RoadId, ExplicitPath = CopyPath(nd.ExplicitPath) };
                     n = seg;
                 }
                 n.Id = nd.Id;
-                n.PortIds = nd.PortIds ?? new List<string>();
+                n.PortIds = nd.PortIds == null ? new List<string>() : new List<string>(nd.PortIds);
                 g.Nodes[n.Id] = n;
             }
             return g;
+        }
+
+        static List<LaneConnection> CopyLinks(List<LaneConnection> source)
+        {
+            var result = new List<LaneConnection>();
+            if (source != null) foreach (var l in source)
+                result.Add(new LaneConnection { FromPortId = l.FromPortId, ToPortId = l.ToPortId,
+                    FromLane = l.FromLane, ToLane = l.ToLane });
+            return result;
+        }
+
+        static List<PathElementDto> CopyPath(List<PathElementDto> source)
+        {
+            if (source == null) return null;
+            var result = new List<PathElementDto>();
+            foreach (var e in source) result.Add(new PathElementDto { Kind = e.Kind,
+                A = e.A, B = e.B, Center = e.Center, Radius = e.Radius,
+                StartAngle = e.StartAngle, Sweep = e.Sweep });
+            return result;
         }
     }
 }

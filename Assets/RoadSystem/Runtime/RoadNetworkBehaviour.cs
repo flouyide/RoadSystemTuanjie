@@ -44,6 +44,153 @@ namespace RoadSystem
         /// <summary>道路分组 Id → 分组 GameObject（路段 mesh 的父物体）；一条道路（一次建造流程）一个组。</summary>
         readonly Dictionary<string, GameObject> roadObjects = new Dictionary<string, GameObject>();
         bool warnedMissingIntersectionMaterial;
+        GameObject buildPreview;
+        readonly Dictionary<Renderer, bool> previewHidden = new Dictionary<Renderer, bool>();
+        RoadBuildPlan displayedPlan;
+
+        public RoadBuildSettings BuildSettings => new RoadBuildSettings {
+            Sagitta = System.Math.Max(.001, sagitta), CornerRadius = intersectionCornerRadius, Curve = intersectionCurve };
+
+        public bool TrySnapIntersection(DVec2 point, float y, out string id, out DVec2 position, out float height)
+        {
+            EnsureGraph();
+            return RoadBuildPlanner.TrySnapIntersection(Graph, point, y, BuildSettings, out id, out position, out height);
+        }
+
+        public bool TryPlanRoad(Profile start, Profile end, PathChain path, string roadId,
+            string startIntersection, string endIntersection, out RoadBuildPlan plan, out string reason)
+        {
+            EnsureGraph();
+            return RoadBuildPlanner.TryPlan(Graph, start, end, path, roadId, startIntersection,
+                endIntersection, BuildSettings, out plan, out reason);
+        }
+
+        sealed class PreparedNode
+        {
+            public Mesh Mesh;
+            public Vector3 Position;
+            public string RoadId;
+            public bool Intersection;
+        }
+
+        bool PrepareMeshes(RoadBuildPlan plan, out Dictionary<string, PreparedNode> meshes, out string reason)
+        {
+            meshes = new Dictionary<string, PreparedNode>();
+            reason = null;
+            try
+            {
+                foreach (var id in plan.ChangedNodes)
+                {
+                    var node = plan.Result.GetNode(id);
+                    if (node == null) continue;
+                    var item = new PreparedNode();
+                    if (node is RoadSegment segment)
+                    {
+                        var p = plan.Result.GetProfile(segment.PortIds[0]);
+                        var path = SegmentPathResolver.Resolve(plan.Result, segment);
+                        item.Mesh = SegmentMeshBuilder.Build(path, p.Lanes, p.Position, sagitta, texturePeriod);
+                        item.Position = new Vector3((float)p.Position.X, p.Y, (float)p.Position.Y);
+                        item.RoadId = segment.RoadId;
+                    }
+                    else if (node is Intersection ix)
+                    {
+                        var ports = IntersectionBuilder.LivePorts(plan.Result, ix);
+                        var center = ix.HasAnchor ? ix.Anchor : IntersectionBuilder.CenterOf(ports);
+                        float y = ix.HasAnchor ? ix.AnchorY : ports[0].Y;
+                        item.Mesh = IntersectionMeshBuilder.Build(plan.Boundaries[ix.Id], center, y, vPeriod: texturePeriod);
+                        item.Position = new Vector3((float)center.X, y, (float)center.Y);
+                        item.Intersection = true;
+                    }
+                    meshes[id] = item;
+                    if (item.Mesh == null || item.Mesh.vertexCount == 0)
+                        throw new System.InvalidOperationException("道路或路口网格生成失败");
+                }
+                return true;
+            }
+            catch (System.Exception e)
+            {
+                foreach (var item in meshes.Values) if (item.Mesh != null) DestroyChild(item.Mesh);
+                meshes.Clear();
+                reason = e.Message;
+                return false;
+            }
+        }
+
+        /// <summary>All meshes and serialization are prepared before replacing the live graph.</summary>
+        public bool TryCommitRoadPlan(RoadBuildPlan plan, out string reason)
+        {
+            reason = null;
+            if (plan == null || !plan.IsCurrent(Graph, BuildSettings))
+            { reason = "路网或建造参数已变化，请重新预览"; return false; }
+            string json = RoadGraphJson.ToJson(plan.Result);
+            if (!PrepareMeshes(plan, out var meshes, out reason)) return false;
+            ClearBuildPreview();
+            if (graphSubscribed) Graph.Changed -= OnGraphChanged;
+            Graph = plan.Result;
+            Graph.Changed += OnGraphChanged;
+            graphSubscribed = true;
+            graphJson = appliedJson = json;
+            dirtyNodes.Clear();
+            foreach (var id in plan.ChangedNodes)
+            {
+                if (!meshes.TryGetValue(id, out var item))
+                {
+                    if (nodeObjects.TryGetValue(id, out var dead)) DestroyChild(dead);
+                    nodeObjects.Remove(id);
+                    continue;
+                }
+                var go = GetOrCreateNodeObject(id, item.RoadId, out var mf, out var mr, out var mc);
+                if (item.Intersection) go.name = $"Inter_{id}";
+                go.transform.position = item.Position;
+                var old = mf.sharedMesh;
+                mf.sharedMesh = item.Mesh;
+                mr.sharedMaterial = item.Intersection ? IntersectionMaterial : RoadMaterial;
+                if (mc != null) mc.sharedMesh = item.Mesh;
+                if (old != null) DestroyChild(old);
+            }
+#if UNITY_EDITOR
+            if (!Application.isPlaying) UnityEditor.EditorUtility.SetDirty(this);
+#endif
+            return true;
+        }
+
+        public bool ShowBuildPreview(RoadBuildPlan plan, Material material, float lift = .03f)
+        {
+            if (plan == displayedPlan && buildPreview != null) return true;
+            ClearBuildPreview();
+            if (plan == null || !plan.IsCurrent(Graph, BuildSettings)
+                || !PrepareMeshes(plan, out var meshes, out _)) return false;
+            var combines = new List<CombineInstance>();
+            foreach (var item in meshes.Values)
+                for (int sub = 0; sub < item.Mesh.subMeshCount; sub++)
+                    combines.Add(new CombineInstance { mesh = item.Mesh, subMeshIndex = sub,
+                        transform = Matrix4x4.Translate(item.Position + Vector3.up * lift) });
+            var combined = new Mesh { name = "RoadBuildPreview", indexFormat = UnityEngine.Rendering.IndexFormat.UInt32 };
+            combined.CombineMeshes(combines.ToArray(), true, true);
+            foreach (var item in meshes.Values) DestroyChild(item.Mesh);
+            buildPreview = new GameObject("~RoadBuildPreview") { hideFlags = HideFlags.HideAndDontSave };
+            buildPreview.AddComponent<MeshFilter>().sharedMesh = combined;
+            buildPreview.AddComponent<MeshRenderer>().sharedMaterial = material;
+            foreach (var id in plan.ChangedNodes)
+                if (nodeObjects.TryGetValue(id, out var go) && go != null)
+                {
+                    var renderer = go.GetComponent<Renderer>();
+                    if (renderer == null) continue;
+                    previewHidden[renderer] = renderer.enabled;
+                    renderer.enabled = false;
+                }
+            displayedPlan = plan;
+            return true;
+        }
+
+        public void ClearBuildPreview()
+        {
+            foreach (var entry in previewHidden) if (entry.Key != null) entry.Key.enabled = entry.Value;
+            previewHidden.Clear();
+            if (buildPreview != null) DestroyChild(buildPreview);
+            buildPreview = null;
+            displayedPlan = null;
+        }
 
         /// <summary>道路材质访问器：未配置时懒创建默认 URP Lit 灰材质（仅编辑器且有对应 shader 时）。</summary>
         public Material RoadMaterial
@@ -249,6 +396,7 @@ namespace RoadSystem
         /// <summary>禁用时解绑 Graph.Changed 事件，避免悬空引用/重复触发。</summary>
         void OnDisable()
         {
+            ClearBuildPreview();
             if (Graph != null && graphSubscribed)
             {
                 Graph.Changed -= OnGraphChanged;
@@ -297,6 +445,7 @@ namespace RoadSystem
         /// <summary>全量重建：反订阅旧图→重新反序列化→订阅新图，销毁旧派生物体，重建所有路段（覆盖换图/Undo）。</summary>
         void RebuildAll()
         {
+            ClearBuildPreview();
             appliedJson = graphJson;
             // 换图：反订阅旧图 → 反序列化 → 订阅新图
             if (Graph != null && graphSubscribed) Graph.Changed -= OnGraphChanged;
@@ -372,7 +521,7 @@ namespace RoadSystem
             if (ports.Count < 3) return; // 退化（待合并清理），不生成网格
             IntersectionBuilder.RefreshLanePaths(Graph, ix);
 
-            var center = IntersectionBuilder.CenterOf(ports);
+            var center = ix.HasAnchor ? ix.Anchor : IntersectionBuilder.CenterOf(ports);
             var loop = IntersectionBuilder.BuildBoundaryLoop(ports, center, sagitta,
                 intersectionCornerRadius, intersectionCurve);
             if (loop == null || loop.Count < 3) return;
@@ -381,13 +530,13 @@ namespace RoadSystem
             foreach (var p in ports) avgY += p.Y;
             avgY /= ports.Count;
 
+            var mesh = IntersectionMeshBuilder.Build(loop, center, (float)avgY, vPeriod: texturePeriod);
+            if (mesh == null) return;
             var go = GetOrCreateNodeObject(ix.Id, null, out var mf, out var mr, out var mc);
             go.name = $"Inter_{ix.Id}";
             go.transform.position = new Vector3((float)center.X, (float)avgY, (float)center.Y);
 
             var oldMesh = mf.sharedMesh;
-            var mesh = IntersectionMeshBuilder.Build(loop, center, (float)avgY, vPeriod: texturePeriod);
-            if (mesh == null) return;
             mesh.name = $"Intersection_{ix.Id.Substring(0, 6)}";
             mf.sharedMesh = mesh;
             mr.sharedMaterial = IntersectionMaterial;
@@ -442,6 +591,12 @@ namespace RoadSystem
         static void DestroyChild(Object o)
         {
             if (o == null) return;
+            if (o is GameObject go)
+            {
+                go.SetActive(false);
+                var filter = go.GetComponent<MeshFilter>();
+                if (filter != null && filter.sharedMesh != null) DestroyChild(filter.sharedMesh);
+            }
             if (Application.isPlaying) Destroy(o);
             else DestroyImmediate(o);
         }

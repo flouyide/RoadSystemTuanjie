@@ -11,6 +11,7 @@ namespace RoadSystem.Core
     {
         public readonly Dictionary<string, RoadNodeBase> Nodes = new Dictionary<string, RoadNodeBase>();
         public readonly Dictionary<string, Profile> Profiles = new Dictionary<string, Profile>();
+        public long Revision { get; private set; }
 
         /// <summary>受影响节点 Id 集合（路段/路口）。</summary>
         public event Action<IReadOnlyList<string>> Changed;
@@ -21,6 +22,7 @@ namespace RoadSystem.Core
         {
             var p = Profile.Create(pos, dir, lanes);
             Profiles.Add(p.Id, p);
+            Revision++;
             return p;
         }
 
@@ -89,7 +91,7 @@ namespace RoadSystem.Core
             if (p == null) return;
             if (!string.IsNullOrEmpty(p.NodeAId) && Nodes.ContainsKey(p.NodeAId)) return; // 非悬空
             if (!string.IsNullOrEmpty(p.NodeBId) && Nodes.ContainsKey(p.NodeBId)) return;
-            Profiles.Remove(p.Id);
+            if (Profiles.Remove(p.Id)) Revision++;
         }
 
         // ---------------- 查询 ----------------
@@ -161,6 +163,7 @@ namespace RoadSystem.Core
         //触发 Changed 事件，把 [seg.Id] 传给订阅者(宿主的 OnGraphChanged)
         void NotifyAffected(IReadOnlyList<string> ids)
         {
+            Revision++;
             if (ids == null || ids.Count == 0) return;
             foreach (var id in ids)
             {
@@ -174,6 +177,7 @@ namespace RoadSystem.Core
         {
             Nodes.Clear();
             Profiles.Clear();
+            Revision++;
         }
     }
 }
