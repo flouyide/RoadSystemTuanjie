@@ -22,13 +22,18 @@ namespace RoadSystem.Geometry
             return ConnectCenters(src.Position, src.Direction, dst.Position, dst.Direction, 0);
         }
 
-        public static PathChain ConnectCenters(DVec2 a, DVec2 dA, DVec2 b, DVec2 dB, int depth)
+        /// <summary>Existing road endpoints are hard boundary conditions, including behind the start plane.</summary>
+        public static PathChain ConnectExact(Profile src, Profile dst)
+            => src == null || dst == null ? null
+                : ConnectCenters(src.Position, src.Direction, dst.Position, dst.Direction, 0, true);
+
+        public static PathChain ConnectCenters(DVec2 a, DVec2 dA, DVec2 b, DVec2 dB, int depth, bool preserveTangents = false)
         {
             dA = dA.Normalized;
             dB = dB.Normalized;
 
             // 0. 半平面约束（几何层防御，编辑器层同样前置约束）
-            if (DVec2.Dot(b - a, dA) < 0)
+            if (!preserveTangents && DVec2.Dot(b - a, dA) < 0)
                 dB = dA;
 
             double dist = DVec2.Distance(a, b);
@@ -46,12 +51,12 @@ namespace RoadSystem.Geometry
                     // 半圆+直线仅适用于反向平行的 U 形回转（见下）。
                     var collinear = TryCollinear(a, dA, b);
                     if (collinear != null) return collinear;
-                    return HermiteSplit(a, dA, b, dB, depth);
+                    return HermiteSplit(a, dA, b, dB, depth, preserveTangents);
                 }
                 // 平行反向 → U 形回转：直线 + 半圆（或 半圆 + 直线）
                 var uTurn = TryUTurn(a, dA, b);
                 if (uTurn != null) return uTurn;
-                return HermiteSplit(a, dA, b, dB, depth);
+                return HermiteSplit(a, dA, b, dB, depth, preserveTangents);
             }
 
             // 非平行：尝试单 fillet
@@ -59,7 +64,7 @@ namespace RoadSystem.Geometry
             if (fillet != null) return fillet;
 
             // 交点在后方等不可单 fillet 情形 → Hermite 拆分
-            return HermiteSplit(a, dA, b, dB, depth);
+            return HermiteSplit(a, dA, b, dB, depth, preserveTangents);
         }
 
         /// <summary>平行同向且共线、目标在正前方 → 单直线；否则返回 null。</summary>
@@ -120,7 +125,7 @@ namespace RoadSystem.Geometry
         /// 切向模长取中心距的 HermiteTangentScale 倍（1.0~1.5 推荐区间），
         /// 在 t=0.5 求 P（中间 profile 中心）与 P′（切向），递归拆成两个子问题。均为 O(1) 闭式。
         /// </summary>
-        static PathChain HermiteSplit(DVec2 a, DVec2 dA, DVec2 b, DVec2 dB, int depth)
+        static PathChain HermiteSplit(DVec2 a, DVec2 dA, DVec2 b, DVec2 dB, int depth, bool preserveTangents)
         {
             if (depth >= GeomConsts.MaxDepth) return null;
 
@@ -138,9 +143,9 @@ namespace RoadSystem.Geometry
             if (midTan.Length < GeomConsts.DistEps) return null;
             midTan = midTan.Normalized;
 
-            var first = ConnectCenters(a, dA, midPos, midTan, depth + 1);
+            var first = ConnectCenters(a, dA, midPos, midTan, depth + 1, preserveTangents);
             if (first == null) return null;
-            var second = ConnectCenters(midPos, midTan, b, dB, depth + 1);
+            var second = ConnectCenters(midPos, midTan, b, dB, depth + 1, preserveTangents);
             if (second == null) return null;
 
             first.Append(second);

@@ -4,6 +4,8 @@ using RoadSystem.Meshing;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
+using TMPro;
+using System.Linq;
 #if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 #endif
@@ -26,7 +28,7 @@ namespace RoadSystem
     ///  场景中名为 "Straight" / "Curve" 的 UI 按钮会在 Awake 时自动挂接模式切换（也可用 Inspector 的 buildMode 预设）；
     ///  右键 / Esc 或切换模式取消当前未完成道路。
     ///  自动吸附既有悬空端（looseEndSnap 米）。不可建造时显示红色预览与原因。
-    ///  每条完成的道路使用一个道路分组 Id，场景中归到各自 road_xxxxxx 子 GameObject 下。
+    ///  无路口的延伸结果为一个道路 GameObject；同组被路口拆开的多段使用 road_xxxxxx 分组。
     /// 挂在 RoadNetworkBehaviour 同一物体上即可；buildEnabled 可运行时开关。
     /// </summary>
     [RequireComponent(typeof(RoadNetworkBehaviour))]
@@ -62,8 +64,8 @@ namespace RoadSystem
         /// <summary>取消当前待连起点动作引用（Button），可接右键或 Esc；对应 IA_RoadBuilder 的 Cancel。</summary>
         [Tooltip("取消起点（Button），可接 RightClick 或 Cancel（Esc）")]
         [SerializeField] InputActionReference cancelActionRef;
-        /// <summary>删除最后一段动作引用（Button），可选；对应 IA_RoadBuilder 的 Delete。</summary>
-        [Tooltip("删除最后一段（Button），对应 IA_RoadBuilder 的 Delete；可选")]
+        /// <summary>切换删除模式的可配置动作引用；对应 IA_RoadBuilder 的 Delete。</summary>
+        [Tooltip("切换删除模式（Button），在 Input Action 中配置按键；对应 IA_RoadBuilder 的 Delete")]
         [SerializeField] InputActionReference deleteActionRef;
 
         /// <summary>鼠标位置动作的便捷访问器，未配置引用时返回 null。</summary>
@@ -85,6 +87,13 @@ namespace RoadSystem
         [SerializeField, Tooltip("位置网格吸附步长（米），0 关闭")] float gridSnap = 0f;
         /// <summary>最小路段长度（米）；短于此的点击被忽略。</summary>
         [SerializeField, Tooltip("最小路段长度（米）")] float minSegmentLength = 1f;
+        [SerializeField, Min(0), Tooltip("弯路第二击控制点辅助吸附距离；0 关闭辅助")]
+        float controlPointSnap = 5f;
+        [SerializeField, Min(1), Tooltip("控制点辅助搜索的目标端点范围（米）")]
+        float controlTargetRange = 500f;
+        string endpointHint, controlTargetId;
+        DVec2? endpointMarker, controlMarker;
+        float markerY;
         /// <summary>预览 mesh 的 Y 抬高量，防止与正式道路 Z-fighting。</summary>
         [SerializeField, Tooltip("预览网格抬高量，防 Z-fighting")] float previewLift = 0.03f;
         /// <summary>路口边缘形状：0 为当前圆角，1 为直边。</summary>
@@ -96,6 +105,19 @@ namespace RoadSystem
         [SerializeField] Color previewOkColor = new Color(0.2f, 0.9f, 1f, 0.45f);
         /// <summary>预览非法（后方半平面或过短）时的警示颜色，红色半透明。</summary>
         [SerializeField] Color previewBadColor = new Color(1f, 0.35f, 0.2f, 0.45f);
+
+        [Header("删除模式")]
+        [SerializeField, Tooltip("删除拾取射线检测层；必须包含道路和遮挡物，防止穿透误删")]
+        LayerMask deletionRaycastMask = Physics.DefaultRaycastLayers;
+        [SerializeField] Color deleteHighlightColor = new Color(1f, .65f, .1f, .65f);
+        public bool IsDeleteMode { get; private set; }
+        string deleteTargetId, deleteReason;
+        RoadDeletePlan deletePlan;
+        RoadGraph deleteSource;
+        long deleteRevision;
+        RoadBuildSettings deleteSettings;
+        Material matDelete;
+        int suppressInputFrame = -1;
 
         // ---- 运行时状态字段 ----
 
@@ -113,9 +135,9 @@ namespace RoadSystem
         DVec2 curveStartPos, curveControlPos;
         float curveStartY;
         string curveStartId;
-        /// <summary>上一条已完成道路末尾 profile 的 Id；仅在下一条路的第一击吸附中被排除，避免新道路误接旧弯路末尾。</summary>
+        /// <summary>上次提交后仍存活的可延伸外端；不排除连续续建。</summary>
         string lastRoadEndId;
-        /// <summary>直路当前分组 Id；完成或取消时清空。</summary>
+        /// <summary>本次建造的候选分组 Id；延伸时由规划器决定继承或合并分组，结束后清空。</summary>
         string currentRoadId;
 
         /// <summary>从活图解析当前起点 profile；Id 为空或已被删除时返回 null。</summary>
@@ -129,6 +151,7 @@ namespace RoadSystem
         /// <summary>切换建造模式；若正有未完成道路则取消之，避免两种模式的段混在同一条路里。</summary>
         public void SetBuildMode(RoadBuildMode mode)
         {
+            SetDeleteMode(false);
             if (buildMode == mode) return;
             buildMode = mode;
             if (Application.isPlaying) CancelPending();
@@ -206,7 +229,7 @@ namespace RoadSystem
 #endif
         }
 
-        /// <summary>禁用时关闭所有 Input Action 并隐藏预览（不清除 pendingStart，便于重新启用后继续）。</summary>
+        /// <summary>禁用时关闭输入并丢弃未提交草稿。</summary>
         void OnDisable()
         {
 #if ENABLE_INPUT_SYSTEM
@@ -215,46 +238,157 @@ namespace RoadSystem
             CancelAction?.Disable();
             DeleteAction?.Disable();
 #endif
+            SetDeleteMode(false);
             SetPreviewVisible(false);
+            CancelPending();
             previewFailureReason = null;
         }
 
         void OnGUI()
         {
-            if (!Application.isPlaying || !buildEnabled || previewGo == null
-                || !previewGo.activeSelf || string.IsNullOrEmpty(previewFailureReason)) return;
-            if (previewWarningStyle == null)
+            if (!Application.isPlaying || !buildEnabled) return;
+            if (!IsDeleteMode)
             {
-                previewWarningStyle = new GUIStyle(GUI.skin.label)
+                if (endpointMarker.HasValue) DrawMarker(endpointMarker.Value, markerY, Color.cyan);
+                if (controlMarker.HasValue)
                 {
-                    fontSize = 20,
-                    fontStyle = FontStyle.Bold
-                };
-                previewWarningStyle.normal.textColor = new Color(1f, 0.25f, 0.2f);
+                    DrawMarker(controlMarker.Value, curveStartY, Color.yellow);
+                    DrawGuide(curveStartPos, controlMarker.Value, curveStartY);
+                    if (endpointMarker.HasValue) DrawGuide(controlMarker.Value, endpointMarker.Value, curveStartY);
+                }
+                if (!string.IsNullOrEmpty(endpointHint)) GUI.Label(new Rect(16, 60, 1000, 30), endpointHint);
             }
-            GUI.Label(new Rect(16f, 16f, 1000f, 36f),
-                $"无法建造道路：{previewFailureReason}", previewWarningStyle);
+            if (!IsDeleteMode && (previewGo == null || !previewGo.activeSelf || string.IsNullOrEmpty(previewFailureReason))) return;
+            if (previewWarningStyle == null) previewWarningStyle = new GUIStyle(GUI.skin.label)
+                { fontSize = 20, fontStyle = FontStyle.Bold };
+            bool warning = IsDeleteMode ? !string.IsNullOrEmpty(deleteReason) : true;
+            previewWarningStyle.normal.textColor = warning ? new Color(1f, .25f, .2f) : deleteHighlightColor;
+            string text = IsDeleteMode
+                ? (warning ? (deleteTargetId != null ? "无法删除道路：" : "") + deleteReason
+                    : "删除模式：悬停路段并单击左键删除；Esc / 右键退出")
+                : "无法建造道路：" + previewFailureReason;
+            GUI.Label(new Rect(16f, 16f, 1200f, 40f), text, previewWarningStyle);
         }
 
-        /// <summary>每帧主循环：派发输入动作（放置 / 取消 / 删除），并在有待连起点时刷新预览。</summary>
+        void DrawMarker(DVec2 p, float y, Color color)
+        {
+            if (cam == null) return;
+            var s = cam.WorldToScreenPoint(new Vector3((float)p.X, y + previewLift, (float)p.Y));
+            if (s.z <= 0) return;
+            var previous = GUI.color; GUI.color = color;
+            GUI.DrawTexture(new Rect(s.x - 5, Screen.height - s.y - 5, 10, 10), Texture2D.whiteTexture);
+            GUI.color = previous;
+        }
+
+        void DrawGuide(DVec2 a, DVec2 b, float y)
+        {
+            if (cam == null) return;
+            var p = cam.WorldToScreenPoint(new Vector3((float)a.X, y + previewLift, (float)a.Y));
+            var q = cam.WorldToScreenPoint(new Vector3((float)b.X, y + previewLift, (float)b.Y));
+            if (p.z <= 0 || q.z <= 0) return;
+            var start = new Vector2(p.x, Screen.height - p.y); var delta = new Vector2(q.x - p.x, p.y - q.y);
+            var matrix = GUI.matrix; var color = GUI.color; GUI.color = Color.yellow;
+            GUIUtility.RotateAroundPivot(Mathf.Atan2(delta.y, delta.x) * Mathf.Rad2Deg, start);
+            GUI.DrawTexture(new Rect(start.x, start.y, delta.magnitude, 2), Texture2D.whiteTexture);
+            GUI.matrix = matrix; GUI.color = color;
+        }
+
+        static bool TextInputFocused()
+        {
+            var selected = EventSystem.current != null ? EventSystem.current.currentSelectedGameObject : null;
+            if (selected == null) return false;
+            var legacy = selected.GetComponent<InputField>();
+            var tmp = selected.GetComponent<TMP_InputField>();
+            return (legacy != null && legacy.isFocused) || (tmp != null && tmp.isFocused);
+        }
+
+        public void SetDeleteMode(bool enabled)
+        {
+            enabled &= buildEnabled && isActiveAndEnabled;
+            suppressInputFrame = Time.frameCount;
+            if (enabled != IsDeleteMode) CancelPending();
+            IsDeleteMode = enabled;
+            ClearDeleteHover();
+        }
+
+        public void ToggleDeleteMode() => SetDeleteMode(!IsDeleteMode);
+
         void Update()
         {
             SyncIntersectionCurve();
 #if ENABLE_INPUT_SYSTEM
-            if (!buildEnabled || cam == null || ClickAction == null) { SetPreviewVisible(false); return; }
-
-            // 鼠标悬停在 UI（如模式按钮）上时忽略本次点击，避免点按钮的同时误落路点
+            if (!buildEnabled || cam == null || ClickAction == null)
+            { if (IsDeleteMode) SetDeleteMode(false); CancelPending(); ClearDeleteHover(); SetPreviewVisible(false); return; }
+            if (suppressInputFrame == Time.frameCount) return;
             bool overUi = EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
-
-            if (!overUi && ClickAction.WasPressedThisFrame()) OnLeftClick();
-            if (!overUi && CancelAction != null && CancelAction.WasPressedThisFrame()) CancelPending();
-            if (!overUi && DeleteAction != null && DeleteAction.WasPressedThisFrame()) DeleteLastSegment();
-
+            if (TextInputFocused()) { ClearDeleteHover(); SetPreviewVisible(false); return; }
+            bool cancel = (CancelAction != null && CancelAction.WasPressedThisFrame())
+                || (Keyboard.current != null && Keyboard.current.escapeKey.wasPressedThisFrame)
+                || (Mouse.current != null && Mouse.current.rightButton.wasPressedThisFrame);
+            if (cancel)
+            { if (IsDeleteMode) SetDeleteMode(false); else CancelPending(); return; }
+            if (!overUi && DeleteAction != null && DeleteAction.WasPressedThisFrame())
+            { ToggleDeleteMode(); return; }
+            if (overUi) { ClearDeleteHover(); SetPreviewVisible(false); return; }
+            if (IsDeleteMode)
+            {
+                UpdateDeleteHover();
+                if (ClickAction.WasPressedThisFrame() && deletePlan != null)
+                {
+                    if (net.TryCommitDeletePlan(deletePlan, out var reason)) ClearDeleteHover();
+                    else { deleteReason = reason; deletePlan = null; net.ClearBuildPreview(); }
+                    return;
+                }
+                DrawDeleteHighlight();
+                return;
+            }
+            if (ClickAction.WasPressedThisFrame()) OnLeftClick();
             if (buildMode == RoadBuildMode.Curve && curveStage > 0) UpdateCurvePreview();
             else if (pendingStartId != null) UpdatePreview();
-#else
-            // 未启用 Input System 时静默不工作（Project Settings → Active Input Handler）
+            else if (GroundPoint(out var hover, out float hoverY))
+            { hoverY += roadYOffset; ResolveEndpoint(ref hover, ref hoverY, out _); }
 #endif
+        }
+
+        void ClearDeleteHover()
+        {
+            if (deleteTargetId != null && net != null) net.ClearBuildPreview();
+            deleteTargetId = null; deletePlan = null; deleteSource = null; deleteReason = null;
+        }
+
+        void UpdateDeleteHover()
+        {
+#if ENABLE_INPUT_SYSTEM
+            if (PointAction == null) { ClearDeleteHover(); return; }
+            var ray = cam.ScreenPointToRay(PointAction.ReadValue<Vector2>());
+            // Use the first physical hit including occluders. Never raycast through an intersection.
+            if (!Physics.Raycast(ray, out var hit, 2000, deletionRaycastMask, QueryTriggerInteraction.Ignore))
+            { ClearDeleteHover(); return; }
+            if (!net.TryGetSegment(hit.collider, out var id, out var pickReason))
+            { ClearDeleteHover(); deleteReason = pickReason; return; }
+            if (id == deleteTargetId && ReferenceEquals(deleteSource, net.Graph)
+                && deleteRevision == net.Graph.Revision && deleteSettings.Equals(net.BuildSettings)) return;
+            ClearDeleteHover();
+            deleteTargetId = id; deleteSource = net.Graph; deleteRevision = net.Graph.Revision;
+            deleteSettings = net.BuildSettings;
+            if (net.TryPlanDelete(id, out deletePlan, out deleteReason))
+            {
+                EnsurePreviewObjects();
+                if (!net.ShowBuildPreview(deletePlan.Edit, matOk, previewLift))
+                { deletePlan = null; deleteReason = "删除预览无法生成"; }
+            }
+#endif
+        }
+
+        void DrawDeleteHighlight()
+        {
+            if (deleteTargetId == null || !net.TryGetNodeVisual(deleteTargetId, out var mesh, out var matrix)) return;
+            EnsurePreviewObjects();
+            if (matDelete == null) matDelete = MakePreviewMaterial(deleteHighlightColor);
+            var material = deletePlan != null ? matDelete : matBad;
+            for (int sub = 0; sub < mesh.subMeshCount; sub++)
+                Graphics.DrawMesh(mesh, Matrix4x4.Translate(Vector3.up * previewLift) * matrix,
+                    material, 0, cam, sub, null, UnityEngine.Rendering.ShadowCastingMode.Off, false);
         }
 
         void OnValidate()
@@ -275,7 +409,6 @@ namespace RoadSystem
         void OnLeftClick()
         {
             if (!GroundPoint(out var pos, out float groundY)) return;
-            pos = SnapPos(pos);
             float roadY = groundY + roadYOffset;
             if (buildMode == RoadBuildMode.Curve) { OnCurveClick(pos, roadY); return; }
             var start = PendingStart;
@@ -306,11 +439,15 @@ namespace RoadSystem
         // Intersection pavement takes priority over nearby segment ports/centerlines.
         Profile ResolveEndpoint(ref DVec2 pos, ref float y, out string intersection, string excludeId = null)
         {
+            endpointHint = null; endpointMarker = null;
             if (net.TrySnapIntersection(pos, y, out intersection, out var anchor, out var height))
-            { pos = anchor; y = height; return null; }
+            { pos = anchor; y = height; endpointHint = "连接路口"; endpointMarker = pos; markerY = y; return null; }
             var loose = FindLooseEnd(pos, excludeId);
-            if (loose != null) { pos = loose.Position; y = loose.Y; return loose; }
-            if (IntersectionBuilder.TrySnapToRoad(net.Graph, pos, RoadCenterSnapDistance, out var roadPoint)) pos = roadPoint;
+            if (loose != null)
+            { pos = loose.Position; y = loose.Y; endpointHint = "延伸道路"; endpointMarker = pos; markerY = y; return loose; }
+            if (IntersectionBuilder.TrySnapToRoad(net.Graph, pos, RoadCenterSnapDistance, out var roadPoint))
+            { pos = roadPoint; endpointHint = "新建路口"; endpointMarker = pos; markerY = y; }
+            else pos = SnapPos(pos);
             return null;
         }
 
@@ -320,18 +457,32 @@ namespace RoadSystem
             candidatePlan = null; end = null; path = null; reason = null;
             start = PendingStart;
             if (start == null) { reason = "起点已不存在"; return false; }
+            if (!pendingStartIsNew)
+            {
+                start = EndpointExtension.View(net.Graph, start.Id, true);
+                if (start == null) { reason = "起点已不可延伸"; return false; }
+            }
             var loose = ResolveEndpoint(ref pos, ref y, out var endIntersection, start.Id);
+            var target = loose != null ? EndpointExtension.View(net.Graph, loose.Id, false) : null;
+            if (loose != null && target == null) { reason = "目标道路路径已失效"; return false; }
             var direction = (pos - start.Position).Normalized;
             if (DVec2.Distance(pos, start.Position) < minSegmentLength)
             { reason = "道路长度不足"; return false; }
             if (pendingStartIsNew)
             {
-                var draft = Profile.Create(start.Position, direction, start.Lanes);
+                var draft = Profile.Create(start.Position, direction, target != null ? target.Lanes : start.Lanes);
                 draft.Id = start.Id; draft.Y = start.Y; start = draft;
             }
-            end = loose ?? Profile.Create(pos, ComputeEndDirection(start, pos), (LaneDef[])start.Lanes.Clone());
+            end = target ?? Profile.Create(pos, ComputeEndDirection(start, pos), (LaneDef[])start.Lanes.Clone());
             if (loose == null) end.Y = y;
-            path = ProfileConnector.Connect(start, end);
+            if (!pendingStartIsNew || target != null)
+            {
+                path = EndpointExtension.ConnectAutomatic(start, end, !pendingStartIsNew, target != null);
+                if (path == null) { reason = "没有足够空间连接剩余道路"; return false; }
+                if (pendingStartIsNew) start.Direction = path.StartTangent;
+                if (target == null) end.Direction = path.EndTangent;
+            }
+            else path = ProfileConnector.Connect(start, end);
             return net.TryPlanRoad(start, end, path, currentRoadId, pendingIntersectionId,
                 endIntersection, out candidatePlan, out reason);
         }
@@ -352,8 +503,8 @@ namespace RoadSystem
             }
             if (curveStage == 1)
             {
-                if (DVec2.Distance(curveStartPos, pos) < minSegmentLength) return;
-                curveControlPos = pos;
+                if (!TryControlPoint(pos, out var control, out previewFailureReason)) return;
+                curveControlPos = control;
                 curveStage = 2;
                 lastPreviewKey = null;
                 return;
@@ -376,11 +527,12 @@ namespace RoadSystem
             out Profile end, out PathChain path, out string reason)
         {
             candidatePlan = null;
-            start = curveStartId != null ? net.Graph.GetProfile(curveStartId) : null;
+            start = curveStartId != null ? EndpointExtension.View(net.Graph, curveStartId, true) : null;
+            controlMarker = curveControlPos;
             end = null;
             path = null;
             reason = null;
-            if (curveStartId != null && (start == null || !start.IsLooseEnd))
+            if (curveStartId != null && start == null)
             {
                 reason = "起点已不可连接";
                 return false;
@@ -391,12 +543,15 @@ namespace RoadSystem
                 start.Y = curveStartY;
             }
 
-            end = ResolveEndpoint(ref pos, ref roadY, out var endIntersection, curveStartId);
+            var target = ResolveEndpoint(ref pos, ref roadY, out var endIntersection, curveStartId);
+            end = target != null ? EndpointExtension.View(net.Graph, target.Id, false) : null;
+            if (target != null && end == null) { reason = "目标道路路径已失效"; return false; }
+            if (curveStartId == null && end != null) start.Lanes = (LaneDef[])end.Lanes.Clone();
 
             path = ControlPointCurve.Solve(start.Position, curveControlPos, pos,
                 minSegmentLength, start.TotalWidth * 0.5 + 0.5, out reason);
             if (path == null) return false;
-            const double tangentTolerance = 0.966; // 15 degrees
+            const double tangentTolerance = EndpointExtension.TangentDot;
             if (curveStartId != null
                 && DVec2.Dot(start.Direction, path.StartTangent) < tangentTolerance)
             {
@@ -418,19 +573,50 @@ namespace RoadSystem
                 endIntersection, out candidatePlan, out reason);
         }
 
+        bool TryControlPoint(DVec2 cursor, out DVec2 control, out string reason)
+        {
+            reason = null; controlTargetId = null; endpointMarker = null; endpointHint = null;
+            var start = curveStartId != null ? EndpointExtension.View(net.Graph, curveStartId, true) : null;
+            control = SnapPos(cursor);
+            if (curveStartId != null && start == null) { reason = "起点已不可延伸"; return false; }
+            if (start != null) control = start.Position + start.Direction * DVec2.Dot(cursor - start.Position, start.Direction);
+            double best = controlPointSnap;
+            if (controlPointSnap > 0 && looseEndSnap > 0)
+                foreach (var p in net.Graph.Profiles.Values.OrderBy(p => p.Id, System.StringComparer.Ordinal))
+                {
+                    if (p.Id == curveStartId || DVec2.Distance(p.Position, curveStartPos) > controlTargetRange
+                        || System.Math.Abs(p.Y - curveStartY) > 1e-4
+                        || EndpointExtension.SameChain(net.Graph, curveStartId, p.Id)) continue;
+                    var end = EndpointExtension.View(net.Graph, p.Id, false);
+                    if (end == null || (start != null && !EndpointExtension.Compatible(start, end))) continue;
+                    if (!EndpointExtension.TryControl(curveStartPos, start?.Direction, end, cursor,
+                        minSegmentLength, (start ?? end).TotalWidth * .5 + .5, out var candidate)) continue;
+                    double distance = DVec2.Distance(cursor, candidate);
+                    if (distance >= best) continue;
+                    best = distance; control = candidate; controlTargetId = p.Id;
+                    endpointMarker = p.Position; markerY = p.Y;
+                }
+            controlMarker = control;
+            if (controlTargetId != null) endpointHint = "控制点已吸附目标切线交点；第三击选择标记端点";
+            if (DVec2.Distance(curveStartPos, control) < minSegmentLength
+                || (start != null && DVec2.Dot(control - start.Position, start.Direction) < minSegmentLength))
+            { reason = "控制点须位于起点前方且距离足够"; return false; }
+            return true;
+        }
+
         string PreviewKey(DVec2 cursor, float y) => $"{cursor.X:R},{cursor.Y:R},{y:R}:" +
             $"{net.Graph.GetHashCode()}:{net.Graph.Revision}:{net.BuildSettings.Sagitta:R}:" +
             $"{net.BuildSettings.CornerRadius:R}:{net.BuildSettings.Curve:R}:{curveStage}:" +
-            $"{curveControlPos.X:R},{curveControlPos.Y:R}:{pendingStartId}:{curveStartId}:{pendingIntersectionId}:{curveIntersectionId}";
+            $"{curveControlPos.X:R},{curveControlPos.Y:R}:{pendingStartId}:{curveStartId}:{pendingIntersectionId}:{curveIntersectionId}:" +
+            $"{looseEndSnap:R}:{gridSnap:R}:{minSegmentLength:R}:{controlPointSnap:R}:{controlTargetRange:R}:{buildMode}:{roadYOffset}:{previewLift:R}";
 
         void UpdateCurvePreview()
         {
             EnsurePreviewObjects();
             if (!GroundPoint(out var cursor, out float groundY)) { SetPreviewVisible(false); return; }
-            cursor = SnapPos(cursor);
             string key = PreviewKey(cursor, groundY);
             if (key == lastPreviewKey) return;
-            var start = curveStartId != null ? net.Graph.GetProfile(curveStartId) : null;
+            var start = curveStartId != null ? EndpointExtension.View(net.Graph, curveStartId, true) : null;
             if (curveStartId != null && start == null) { CancelPending(); return; }
             var origin = start != null ? start.Position : curveStartPos;
             var lanes = start != null ? start.Lanes : Profile.DefaultLanes();
@@ -440,9 +626,8 @@ namespace RoadSystem
             if (curveStage == 1)
             {
                 candidatePlan = null;
-                path = StraightHint(origin, cursor);
-                valid = DVec2.Distance(origin, cursor) >= minSegmentLength;
-                previewFailureReason = valid ? null : "控制点距离起点过近";
+                valid = TryControlPoint(cursor, out var control, out previewFailureReason);
+                path = StraightHint(origin, control);
             }
             else valid = TryCurveCandidate(cursor, groundY + roadYOffset, out _, out _, out path, out previewFailureReason);
             DisplayCandidate(valid, path ?? StraightHint(origin, cursor), lanes, origin, y);
@@ -495,16 +680,6 @@ namespace RoadSystem
             lastPreviewKey = null;
         }
 
-        /// <summary>删除最后一条路段（接 IA_RoadBuilder 的 Delete 动作）。</summary>
-        void DeleteLastSegment()
-        {
-            string lastId = null;
-            long lastVer = long.MinValue;
-            foreach (var n in net.Graph.Nodes.Values)
-                if (n is RoadSegment s && n.DirtyVersion > lastVer) { lastVer = n.DirtyVersion; lastId = n.Id; }
-            if (lastId != null) net.RemoveSegment(lastId);
-        }
-
         /// <summary>预览/提交共用的终点朝向规则（直路段）：后方半平面强制同向，否则取弦向。</summary>
         DVec2 ComputeEndDirection(Profile start, DVec2 endPos)
         {
@@ -536,7 +711,6 @@ namespace RoadSystem
             var start = PendingStart;
             if (start == null || !GroundPoint(out var cursor, out float groundY))
             { SetPreviewVisible(false); previewFailureReason = null; return; }
-            cursor = SnapPos(cursor);
             string key = PreviewKey(cursor, groundY);
             if (key == lastPreviewKey) return;
             bool valid = TryStraightCandidate(cursor, groundY + roadYOffset,
@@ -573,7 +747,11 @@ namespace RoadSystem
         /// <summary>切换预览物体显隐，比较 activeSelf 避免无谓 SetActive。</summary>
         void SetPreviewVisible(bool v)
         {
-            if (!v) { if (net != null) net.ClearBuildPreview(); lastPreviewKey = null; }
+            if (!v)
+            {
+                if (net != null) net.ClearBuildPreview(); lastPreviewKey = null;
+                endpointMarker = controlMarker = null; endpointHint = controlTargetId = null;
+            }
             if (previewGo != null && previewGo.activeSelf != v) previewGo.SetActive(v);
         }
 
@@ -588,6 +766,8 @@ namespace RoadSystem
         /// <summary>销毁时释放预览 mesh / GameObject / 材质，防止运行时资源泄漏。</summary>
         void OnDestroy()
         {
+            ClearDeleteHover();
+            if (matDelete != null) Destroy(matDelete);
             if (net != null) net.ClearBuildPreview();
             if (previewMf != null && previewMf.sharedMesh != null) Destroy(previewMf.sharedMesh);
             if (previewGo != null) Destroy(previewGo);
@@ -597,17 +777,17 @@ namespace RoadSystem
 
         // ---------------- 工具 ----------------
 
-        /// <summary>在吸附半径内查找最近的既有悬空端（排除当前起点自身与上一条路末尾），用于续接/复用。</summary>
+        /// <summary>在吸附半径内查找有效单段端点，允许连续延伸上一条道路。</summary>
         Profile FindLooseEnd(DVec2 pos, string excludeId = null)
         {
             if (looseEndSnap <= 0) return null;
             Profile best = null;
             double bestD = looseEndSnap;
-            foreach (var p in net.Graph.LooseEndProfiles())
+            foreach (var p in net.Graph.Profiles.Values.OrderBy(p => p.Id, System.StringComparer.Ordinal))
             {
+                if (!EndpointExtension.TryGetRoad(net.Graph, p.Id, out _)) continue;
                 if (pendingStartId != null && p.Id == pendingStartId) continue;
                 if (excludeId != null && p.Id == excludeId) continue;
-                if (lastRoadEndId != null && p.Id == lastRoadEndId) continue; // 上一条路末尾：下一条路不误接
                 double d = DVec2.Distance(p.Position, pos);
                 if (d < bestD) { bestD = d; best = p; }
             }

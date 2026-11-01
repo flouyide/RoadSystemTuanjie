@@ -62,6 +62,7 @@ namespace RoadSystem.Core
             return seg;
         }
 
+        /// <summary>Low-level topology primitive; player deletion must go through RoadDeletePlanner.</summary>
         public void RemoveSegment(string segId)
         {
             if (!Nodes.TryGetValue(segId, out var node)) return;

@@ -9,6 +9,21 @@ namespace RoadSystem.Geometry
     /// </summary>
     public static class PathChainUtil
     {
+        /// <summary>Reverse traversal without approximating any line or circular arc.</summary>
+        public static PathChain Reverse(PathChain path)
+        {
+            if (path == null) return null;
+            var result = new PathChain();
+            for (int i = path.Elements.Count - 1; i >= 0; i--)
+            {
+                if (path.Elements[i] is LineElement line) result.Add(new LineElement(line.B, line.A));
+                else if (path.Elements[i] is ArcElement arc)
+                    result.Add(new ArcElement(arc.Center, arc.Radius, arc.StartAngle + arc.Sweep, -arc.Sweep));
+                else return null;
+            }
+            return result;
+        }
+
         /// <summary>
         /// 按累计弧长 s 取点与单位切向。s 被钳制到 [0, TotalLength]。
         /// 空/无效路径返回 false。

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using RoadSystem.Core;
 using RoadSystem.Geometry;
 using RoadSystem.Meshing;
@@ -88,7 +89,9 @@ namespace RoadSystem
                     {
                         var p = plan.Result.GetProfile(segment.PortIds[0]);
                         var path = SegmentPathResolver.Resolve(plan.Result, segment);
-                        item.Mesh = SegmentMeshBuilder.Build(path, p.Lanes, p.Position, sagitta, texturePeriod);
+                        var end = plan.Result.GetProfile(segment.PortIds[1]);
+                        item.Mesh = SegmentMeshBuilder.Build(path, p.Lanes, p.Position, sagitta, texturePeriod,
+                            end.Y - p.Y, p.IsLooseEnd, end.IsLooseEnd);
                         item.Position = new Vector3((float)p.Position.X, p.Y, (float)p.Position.Y);
                         item.RoadId = segment.RoadId;
                     }
@@ -116,71 +119,181 @@ namespace RoadSystem
             }
         }
 
-        /// <summary>All meshes and serialization are prepared before replacing the live graph.</summary>
-        public bool TryCommitRoadPlan(RoadBuildPlan plan, out string reason)
+        public bool TryPlanDelete(string segmentId, out RoadDeletePlan plan, out string reason)
+        {
+            EnsureGraph();
+            return RoadDeletePlanner.TryPlan(Graph, segmentId, BuildSettings, out plan, out reason);
+        }
+
+        public bool TryCommitDeletePlan(RoadDeletePlan plan, out string reason)
+            => TryCommitRoadPlan(plan?.Edit, out reason, true);
+
+        /// <summary>Prepare inactive objects and cooked colliders, then swap. Old resources survive rollback.</summary>
+        public bool TryCommitRoadPlan(RoadBuildPlan plan, out string reason, bool recordUndo = true)
         {
             reason = null;
             if (plan == null || !plan.IsCurrent(Graph, BuildSettings))
-            { reason = "路网或建造参数已变化，请重新预览"; return false; }
-            string json = RoadGraphJson.ToJson(plan.Result);
-            if (!PrepareMeshes(plan, out var meshes, out reason)) return false;
-            ClearBuildPreview();
-            if (graphSubscribed) Graph.Changed -= OnGraphChanged;
-            Graph = plan.Result;
-            Graph.Changed += OnGraphChanged;
-            graphSubscribed = true;
-            graphJson = appliedJson = json;
-            dirtyNodes.Clear();
-            foreach (var id in plan.ChangedNodes)
+            { ClearBuildPreview(); reason = "路网或建造参数已变化，请重新预览"; return false; }
+            string json;
+            try { json = RoadGraphJson.ToJson(plan.Result); }
+            catch (System.Exception e) { ClearBuildPreview(); reason = "无法保存道路修改：" + e.Message; return false; }
+            if (!PrepareMeshes(plan, out var meshes, out reason)) { ClearBuildPreview(); return false; }
+            var staged = new Dictionary<string, GameObject>();
+            try
             {
-                if (!meshes.TryGetValue(id, out var item))
+                foreach (var pair in meshes)
                 {
-                    if (nodeObjects.TryGetValue(id, out var dead)) DestroyChild(dead);
-                    nodeObjects.Remove(id);
-                    continue;
+                    var item = pair.Value;
+                    var go = new GameObject(item.Intersection ? $"Inter_{pair.Key}" : $"seg_{pair.Key.Substring(0, 6)}")
+                        { hideFlags = HideFlags.DontSave };
+                    staged.Add(pair.Key, go);
+                    go.SetActive(false);
+                    go.layer = nodeObjects.TryGetValue(pair.Key, out var prior) && prior != null ? prior.layer : gameObject.layer;
+                    go.transform.position = item.Position;
+                    go.AddComponent<MeshFilter>().sharedMesh = item.Mesh;
+                    go.AddComponent<MeshRenderer>().sharedMaterial = item.Intersection ? IntersectionMaterial : RoadMaterial;
+                    Physics.BakeMesh(item.Mesh.GetInstanceID(), false);
+                    go.AddComponent<MeshCollider>().sharedMesh = item.Mesh;
+                    go.AddComponent<RoadNodeView>().Bind(this, pair.Key);
                 }
-                var go = GetOrCreateNodeObject(id, item.RoadId, out var mf, out var mr, out var mc);
-                if (item.Intersection) go.name = $"Inter_{id}";
-                go.transform.position = item.Position;
-                var old = mf.sharedMesh;
-                mf.sharedMesh = item.Mesh;
-                mr.sharedMaterial = item.Intersection ? IntersectionMaterial : RoadMaterial;
-                if (mc != null) mc.sharedMesh = item.Mesh;
-                if (old != null) DestroyChild(old);
             }
+            catch (System.Exception e)
+            {
+                foreach (var go in staged.Values)
+                { var filter = go.GetComponent<MeshFilter>(); if (filter != null) filter.sharedMesh = null; DestroyChild(go); }
+                foreach (var item in meshes.Values) DestroyChild(item.Mesh);
+                ClearBuildPreview();
+                reason = "道路网格或碰撞体准备失败：" + e.Message;
+                return false;
+            }
+
+            ClearBuildPreview();
+            var oldGraph = Graph;
+            var oldJson = graphJson; var oldApplied = appliedJson;
+            var oldNodes = new Dictionary<string, GameObject>(nodeObjects);
+            var oldGroups = new Dictionary<string, GameObject>(roadObjects);
+            var oldActive = oldNodes.Where(p => p.Value != null).ToDictionary(p => p.Key, p => p.Value.activeSelf);
+            var oldDirty = dirtyNodes.ToArray();
+            bool oldSubscribed = graphSubscribed;
+            try
+            {
+                if (!plan.IsCurrent(Graph, BuildSettings)) throw new System.InvalidOperationException("路网已变化");
 #if UNITY_EDITOR
-            if (!Application.isPlaying) UnityEditor.EditorUtility.SetDirty(this);
+                if (recordUndo && !Application.isPlaying) UnityEditor.Undo.RecordObject(this, "Edit Road Network");
 #endif
+                foreach (var id in plan.ChangedNodes)
+                    if (nodeObjects.TryGetValue(id, out var old) && old != null) old.SetActive(false);
+                foreach (var id in plan.ChangedNodes) nodeObjects.Remove(id);
+                foreach (var pair in staged)
+                {
+                    var roadId = meshes[pair.Key].RoadId;
+                    pair.Value.transform.SetParent(NeedsGroup(plan.Result, roadId) ? GetOrCreateRoadObject(roadId).transform : transform, true);
+                    nodeObjects[pair.Key] = pair.Value;
+                }
+                if (graphSubscribed) Graph.Changed -= OnGraphChanged;
+                Graph = plan.Result;
+                Graph.Changed += OnGraphChanged;
+                graphSubscribed = true;
+                graphJson = appliedJson = json;
+                dirtyNodes.Clear();
+                foreach (var id in oldDirty)
+                    if (!plan.ChangedNodes.Contains(id)) dirtyNodes.Add(id);
+                foreach (var go in staged.Values) go.SetActive(true);
+#if UNITY_EDITOR
+                if (!Application.isPlaying) UnityEditor.EditorUtility.SetDirty(this);
+#endif
+            }
+            catch (System.Exception e)
+            {
+                if (graphSubscribed) Graph.Changed -= OnGraphChanged;
+                Graph = oldGraph; graphSubscribed = oldSubscribed;
+                if (graphSubscribed) Graph.Changed += OnGraphChanged;
+                graphJson = oldJson; appliedJson = oldApplied;
+                dirtyNodes.Clear(); foreach (var id in oldDirty) dirtyNodes.Add(id);
+                foreach (var go in staged.Values) DestroyChild(go);
+                foreach (var pair in roadObjects) if (!oldGroups.ContainsKey(pair.Key)) DestroyChild(pair.Value);
+                nodeObjects.Clear(); foreach (var pair in oldNodes) nodeObjects.Add(pair.Key, pair.Value);
+                roadObjects.Clear(); foreach (var pair in oldGroups) roadObjects.Add(pair.Key, pair.Value);
+                foreach (var pair in oldActive) if (oldNodes[pair.Key] != null) oldNodes[pair.Key].SetActive(pair.Value);
+                reason = "道路修改已回滚：" + e.Message;
+                return false;
+            }
+            foreach (var id in plan.ChangedNodes)
+                if (oldNodes.TryGetValue(id, out var old) && old != null) DestroyChild(old);
+            var liveGroups = new HashSet<string>(Graph.Segments().Select(seg => seg.RoadId).Where(id => NeedsGroup(Graph, id)));
+            foreach (var id in roadObjects.Keys.ToArray())
+                if (!liveGroups.Contains(id))
+                {
+                    foreach (var go in nodeObjects.Values)
+                        if (go != null && go.transform.parent == roadObjects[id].transform) go.transform.SetParent(transform, true);
+                    DestroyChild(roadObjects[id]); roadObjects.Remove(id);
+                }
             return true;
+        }
+
+        public bool TryGetSegment(Collider collider, out string id, out string reason)
+        {
+            id = null; reason = null;
+            var binding = collider != null ? collider.GetComponent<RoadNodeView>() : null;
+            if (binding == null || binding.Owner != this) return false;
+            if (!nodeObjects.TryGetValue(binding.NodeId, out var current) || current != binding.gameObject) return false;
+            if (Graph.GetNode(binding.NodeId) is Intersection) { reason = "请选择路段，路口不能直接删除"; return false; }
+            if (!(Graph.GetNode(binding.NodeId) is RoadSegment)) return false;
+            id = binding.NodeId;
+            return true;
+        }
+
+        public bool TryGetNodeVisual(string id, out Mesh mesh, out Matrix4x4 matrix)
+        {
+            mesh = null; matrix = Matrix4x4.identity;
+            if (!nodeObjects.TryGetValue(id, out var go) || go == null) return false;
+            mesh = go.GetComponent<MeshFilter>().sharedMesh;
+            matrix = go.transform.localToWorldMatrix;
+            return mesh != null;
         }
 
         public bool ShowBuildPreview(RoadBuildPlan plan, Material material, float lift = .03f)
         {
+            if (plan == null || !plan.IsCurrent(Graph, BuildSettings))
+            { ClearBuildPreview(); return false; }
             if (plan == displayedPlan && buildPreview != null) return true;
             ClearBuildPreview();
-            if (plan == null || !plan.IsCurrent(Graph, BuildSettings)
-                || !PrepareMeshes(plan, out var meshes, out _)) return false;
-            var combines = new List<CombineInstance>();
-            foreach (var item in meshes.Values)
-                for (int sub = 0; sub < item.Mesh.subMeshCount; sub++)
-                    combines.Add(new CombineInstance { mesh = item.Mesh, subMeshIndex = sub,
-                        transform = Matrix4x4.Translate(item.Position + Vector3.up * lift) });
-            var combined = new Mesh { name = "RoadBuildPreview", indexFormat = UnityEngine.Rendering.IndexFormat.UInt32 };
-            combined.CombineMeshes(combines.ToArray(), true, true);
-            foreach (var item in meshes.Values) DestroyChild(item.Mesh);
-            buildPreview = new GameObject("~RoadBuildPreview") { hideFlags = HideFlags.HideAndDontSave };
-            buildPreview.AddComponent<MeshFilter>().sharedMesh = combined;
-            buildPreview.AddComponent<MeshRenderer>().sharedMaterial = material;
-            foreach (var id in plan.ChangedNodes)
-                if (nodeObjects.TryGetValue(id, out var go) && go != null)
-                {
-                    var renderer = go.GetComponent<Renderer>();
-                    if (renderer == null) continue;
-                    previewHidden[renderer] = renderer.enabled;
-                    renderer.enabled = false;
-                }
-            displayedPlan = plan;
-            return true;
+            if (!PrepareMeshes(plan, out var meshes, out _)) return false;
+            Mesh combined = null;
+            try
+            {
+                var combines = new List<CombineInstance>();
+                foreach (var item in meshes.Values)
+                    for (int sub = 0; sub < item.Mesh.subMeshCount; sub++)
+                        combines.Add(new CombineInstance { mesh = item.Mesh, subMeshIndex = sub,
+                            transform = Matrix4x4.Translate(item.Position + Vector3.up * lift) });
+                combined = new Mesh { name = "RoadBuildPreview", indexFormat = UnityEngine.Rendering.IndexFormat.UInt32 };
+                if (combines.Count > 0) combined.CombineMeshes(combines.ToArray(), true, true);
+                buildPreview = new GameObject("~RoadBuildPreview") { hideFlags = HideFlags.HideAndDontSave };
+                buildPreview.AddComponent<MeshFilter>().sharedMesh = combined;
+                combined = null; // The preview object now owns the combined mesh.
+                buildPreview.AddComponent<MeshRenderer>().sharedMaterial = material;
+                foreach (var id in plan.ChangedNodes)
+                    if (nodeObjects.TryGetValue(id, out var go) && go != null)
+                    {
+                        var renderer = go.GetComponent<Renderer>();
+                        if (renderer == null) continue;
+                        previewHidden[renderer] = renderer.enabled;
+                        renderer.enabled = false;
+                    }
+                displayedPlan = plan;
+                return true;
+            }
+            catch (System.Exception)
+            {
+                ClearBuildPreview();
+                return false;
+            }
+            finally
+            {
+                if (combined != null) DestroyChild(combined);
+                foreach (var item in meshes.Values) DestroyChild(item.Mesh);
+            }
         }
 
         public void ClearBuildPreview()
@@ -314,28 +427,11 @@ namespace RoadSystem
             return segment;
         }
 
-        /// <summary>编辑 API：按 Id 删除一条路段及其端口附件；若其端口挂着的路口因此退化（&lt;3 口），
-        /// 自动合并回普通路段。写存档。</summary>
+        /// <summary>安全删除单个路段并更新两端路口；无法桥接或生成网格时保留原图。</summary>
         public void RemoveSegment(string segId)
         {
-            EnsureGraph();
-            // 记录该段 ports 挂的路口（删段后可能退化）
-            var ixIds = new List<string>();
-            if (Graph.GetNode(segId) is RoadSegment seg)
-            {
-                foreach (var pid in seg.PortIds)
-                {
-                    var p = Graph.GetProfile(pid);
-                    if (p == null) continue;
-                    foreach (var nid in new[] { p.NodeAId, p.NodeBId })
-                        if (!string.IsNullOrEmpty(nid)
-                            && Graph.GetNode(nid) is Intersection && !ixIds.Contains(nid))
-                            ixIds.Add(nid);
-                }
-            }
-            Graph.RemoveSegment(segId);
-            foreach (var ixId in ixIds) IntersectionBuilder.MergeDegenerate(Graph, ixId);
-            CommitEdit();
+            if (!TryPlanDelete(segId, out var plan, out var reason) || !TryCommitDeletePlan(plan, out reason))
+                Debug.LogWarning($"[RoadSystem] 无法删除道路：{reason}", this);
         }
 
         /// <summary>M4：检测新段与全图的交汇并自动生成路口（拆分/截断/建 Intersection/车道配对）。
@@ -501,11 +597,12 @@ namespace RoadSystem
             seg.Path = path;
 
             var go = GetOrCreateNodeObject(seg.Id, seg.RoadId, out var mf, out var mr, out var mc);
-            // 几何在 XZ 2D 计算；Y 仅用于渲染抬升（取起点 profile 的 Y，避免与地面重叠）
+            // XZ 使用精确路径，Y 按两端高度沿弧长插值。
             go.transform.position = new Vector3((float)pa.Position.X, pa.Y, (float)pa.Position.Y);
 
             var oldMesh = mf.sharedMesh;
-            var mesh = SegmentMeshBuilder.Build(path, pa.Lanes, pa.Position, sagitta, texturePeriod);
+            var mesh = SegmentMeshBuilder.Build(path, pa.Lanes, pa.Position, sagitta, texturePeriod,
+                pb.Y - pa.Y, pa.IsLooseEnd, pb.IsLooseEnd);
             mesh.name = $"RoadSegment_{seg.Id.Substring(0, 6)}";
             mf.sharedMesh = mesh;
             mr.sharedMaterial = RoadMaterial;
@@ -554,14 +651,16 @@ namespace RoadSystem
             {
                 go = new GameObject($"seg_{nodeId.Substring(0, 6)}")
                 {
-                    hideFlags = HideFlags.DontSave // 派生数据不入场景
+                    hideFlags = HideFlags.DontSave, // 派生数据不入场景
+                    layer = gameObject.layer
                 };
-                var parent = !string.IsNullOrEmpty(roadId) ? GetOrCreateRoadObject(roadId).transform : transform;
+                var parent = NeedsGroup(Graph, roadId) ? GetOrCreateRoadObject(roadId).transform : transform;
                 go.transform.SetParent(parent, false);
                 mf = go.AddComponent<MeshFilter>();
                 mr = go.AddComponent<MeshRenderer>();
                 mc = go.AddComponent<MeshCollider>();
                 nodeObjects[nodeId] = go;
+                go.AddComponent<RoadNodeView>().Bind(this, nodeId);
             }
             else
             {
@@ -586,6 +685,9 @@ namespace RoadSystem
             }
             return go;
         }
+
+        static bool NeedsGroup(RoadGraph graph, string roadId)
+            => !string.IsNullOrEmpty(roadId) && graph.Segments().Count(s => s.RoadId == roadId) > 1;
 
         /// <summary>安全销毁子物体/资源：运行态用 Destroy，编辑态用 DestroyImmediate（供 Undo 正确回滚）。</summary>
         static void DestroyChild(Object o)

@@ -80,8 +80,25 @@ namespace RoadSystem.Geometry
             out RoadBuildPlan plan, out string reason)
         {
             plan = null; reason = null;
-            if (source == null || start == null || end == null || !start.HasSameLayout(end))
+            if (source == null || start == null || end == null)
                 return Fail("道路两端断面不一致", out reason);
+            string startExtension = source.GetProfile(start.Id) != null ? start.Id : null;
+            string endExtension = source.GetProfile(end.Id) != null ? end.Id : null;
+            var orientedStart = startExtension != null ? EndpointExtension.View(source, startExtension, true) : null;
+            var orientedEnd = endExtension != null ? EndpointExtension.View(source, endExtension, false) : null;
+            if ((startExtension != null && (orientedStart == null || DVec2.Distance(start.Position, orientedStart.Position) > 1e-4
+                    || Math.Abs(start.Y - orientedStart.Y) > 1e-4))
+                || (endExtension != null && (orientedEnd == null || DVec2.Distance(end.Position, orientedEnd.Position) > 1e-4
+                    || Math.Abs(end.Y - orientedEnd.Y) > 1e-4)))
+                return Fail("道路端点已被占用或改变", out reason);
+            if (start.Id == end.Id || EndpointExtension.SameChain(source, startExtension, endExtension))
+                return Fail("暂不支持连接同一道路的两端形成闭环", out reason);
+            start = orientedStart ?? Draft(start, orientedEnd?.Lanes);
+            end = orientedEnd ?? Draft(end, orientedStart?.Lanes);
+            bool extending = startExtension != null || endExtension != null;
+            if (!EndpointExtension.Compatible(start, end)) return Fail("道路两端断面或行车方向不兼容", out reason);
+            if (extending && Math.Abs(start.Y - end.Y) > 1e-4)
+                return Fail("端点延伸仅支持同一高度的道路", out reason);
             if (startIntersection != null && startIntersection == endIntersection)
                 return Fail("暂不支持道路两端连接同一路口", out reason);
             path = path ?? ProfileConnector.Connect(start, end);
@@ -90,68 +107,100 @@ namespace RoadSystem.Geometry
             if (DVec2.Distance(path.StartPoint, start.Position) > .01
                 || DVec2.Distance(path.EndPoint, end.Position) > .01)
                 return Fail("道路路径与端点不一致", out reason);
+            if (extending && (DVec2.Distance(path.StartPoint, start.Position) > 1e-4
+                || DVec2.Distance(path.EndPoint, end.Position) > 1e-4
+                || (startExtension != null && DVec2.Dot(path.StartTangent, start.Direction) < EndpointExtension.TangentDot)
+                || (endExtension != null && DVec2.Dot(path.EndTangent, end.Direction) < EndpointExtension.TangentDot)))
+                return Fail("连接路径与已有道路切线不连续", out reason);
+            if (extending && path.Elements.OfType<ArcElement>().Any(arc => arc.Radius <= start.TotalWidth * .5 + .01))
+                return Fail("延伸弯路的内缘半径不足", out reason);
+            if (extending && !EndpointExtension.Continuous(path)) return Fail("延伸路径存在折角或断口", out reason);
 
             var copy = RoadGraphMapper.FromDto(RoadGraphMapper.ToDto(source));
             foreach (var node in source.Nodes.Values) copy.GetNode(node.Id).DirtyVersion = node.DirtyVersion;
             // Old programmatic graphs may only have a cached exact path.
             foreach (var s in source.Segments())
-                if (s.Path != null && copy.GetNode(s.Id) is RoadSegment target)
+                if (s.Path != null && (s.ExplicitPath == null || s.ExplicitPath.Count == 0)
+                    && copy.GetNode(s.Id) is RoadSegment target)
                     target.ExplicitPath = SegmentPathResolver.Store(s.Path);
             var transaction = new RoadBuildPlan { Source = source, SourceRevision = source.Revision,
                 Result = copy, Settings = settings };
             Action<IReadOnlyList<string>> track = ids => { foreach (var id in ids) transaction.ChangedNodes.Add(id); };
             copy.Changed += track;
-            var originalBoundaries = new Dictionary<string, List<DVec2>>();
-
-            foreach (var ix in copy.Nodes.Values.OfType<Intersection>())
+            try
             {
-                bool atStart = ix.Id == startIntersection, atEnd = ix.Id == endIntersection;
-                var polygon = RoadFootprint.Points(Boundary(copy, ix, settings));
-                originalBoundaries[ix.Id] = polygon;
-                if (atStart || atEnd)
+                EndpointExtension.TryGetRoad(copy, startExtension, out var oldStart);
+                EndpointExtension.TryGetRoad(copy, endExtension, out var oldEnd);
+                string mergedRoadId = oldStart == null ? oldEnd?.RoadId : oldEnd == null || oldStart.RoadId == oldEnd.RoadId
+                    ? oldStart.RoadId : Guid.NewGuid().ToString("N");
+                if (!EndpointExtension.Normalize(copy, startExtension, true, oldEnd?.Id)
+                    || !EndpointExtension.Normalize(copy, endExtension, false, oldStart?.Id))
+                    return Fail("道路方向无法安全规范化", out reason);
+                var originalBoundaries = new Dictionary<string, List<DVec2>>();
+
+                foreach (var ix in copy.Nodes.Values.OfType<Intersection>())
                 {
-                    var endpoint = atStart ? start : end;
-                    if (!Anchor(copy, ix, settings, out var anchor, out var y)
-                        || !RoadFootprint.Contains(polygon, endpoint.Position, .01)
-                        || Math.Abs(endpoint.Y - y) > HeightTolerance)
-                        return Fail("路口吸附位置已失效", out reason);
-                    ix.HasAnchor = true; ix.Anchor = anchor; ix.AnchorY = y;
-                    // Only a contiguous endpoint portion may enter the existing junction.
-                    var samples = PathSampler.Sample(path, settings.Sagitta);
-                    if (atEnd) samples.Reverse();
-                    bool exited = false;
-                    foreach (var sample in samples)
+                    bool atStart = ix.Id == startIntersection, atEnd = ix.Id == endIntersection;
+                    var polygon = RoadFootprint.Points(Boundary(copy, ix, settings));
+                    originalBoundaries[ix.Id] = polygon;
+                    if (atStart || atEnd)
                     {
-                        bool inside = RoadFootprint.Contains(polygon, sample.Position);
-                        if (inside && exited) return Fail("道路中段再次穿入已有路口", out reason);
-                        if (!inside) exited = true;
+                        var endpoint = atStart ? start : end;
+                        if (!Anchor(copy, ix, settings, out var anchor, out var y)
+                            || !RoadFootprint.Contains(polygon, endpoint.Position, .01)
+                            || Math.Abs(endpoint.Y - y) > HeightTolerance)
+                            return Fail("路口吸附位置已失效", out reason);
+                        ix.HasAnchor = true; ix.Anchor = anchor; ix.AnchorY = y;
+                        // Only a contiguous endpoint portion may enter the existing junction.
+                        var samples = PathSampler.Sample(path, settings.Sagitta);
+                        if (atEnd) samples.Reverse();
+                        bool exited = false;
+                        foreach (var sample in samples)
+                        {
+                            bool inside = RoadFootprint.Contains(polygon, sample.Position);
+                            if (inside && exited) return Fail("道路中段再次穿入已有路口", out reason);
+                            if (!inside) exited = true;
+                        }
                     }
+                    else if (RoadFootprint.Overlaps(polygon, RoadFootprint.Sweep(path, start.TotalWidth, settings.Sagitta), .01))
+                        return Fail("道路中段穿越或擦碰已有路口，请将端点吸附到路口", out reason);
                 }
-                else if (RoadFootprint.Overlaps(polygon, RoadFootprint.Sweep(path, start.TotalWidth, settings.Sagitta), .01))
-                    return Fail("道路中段穿越或擦碰已有路口，请将端点吸附到路口", out reason);
+                if ((startIntersection != null && !(copy.GetNode(startIntersection) is Intersection))
+                    || (endIntersection != null && !(copy.GetNode(endIntersection) is Intersection)))
+                    return Fail("目标路口已不存在", out reason);
+
+                var a = Endpoint(copy, start, startIntersection != null);
+                var b = Endpoint(copy, end, endIntersection != null);
+                if (a == null || b == null) return Fail("道路端口已被占用或改变", out reason);
+                // A fresh detection group prevents legacy same-RoadId exclusions hiding old-road collisions.
+                var segment = copy.AddSegment(a, b, extending ? Guid.NewGuid().ToString("N") : roadId ?? Guid.NewGuid().ToString("N"));
+                if (segment == null) return Fail("道路端口无法连接", out reason);
+                segment.Path = SegmentPathResolver.Restore(SegmentPathResolver.Store(path));
+                segment.ExplicitPath = SegmentPathResolver.Store(segment.Path);
+                transaction.EndProfileId = b.Id;
+                if (startIntersection != null && !Grow(copy, (Intersection)copy.GetNode(startIntersection), a,
+                    originalBoundaries[startIntersection], settings, out reason)) return false;
+                if (endIntersection != null && !Grow(copy, (Intersection)copy.GetNode(endIntersection), b,
+                    originalBoundaries[endIntersection], settings, out reason)) return false;
+
+                IntersectionBuilder.DetectAndBuild(copy, segment.Id);
+                string finalEnd = transaction.EndProfileId;
+                if (!EndpointExtension.MergeAt(copy, startExtension, ref finalEnd, mergedRoadId)
+                    || !EndpointExtension.MergeAt(copy, endExtension, ref finalEnd, mergedRoadId))
+                    return Fail("端点接缝无法合并为连续道路", out reason);
+                transaction.EndProfileId = EndpointExtension.TryGetRoad(copy, finalEnd, out _) ? finalEnd : null;
+                if (!RoadDeletePlanner.ValidReferences(copy)) return Fail("合并后的道路引用不完整", out reason);
+                if (!Validate(transaction, out reason)) return false;
+                plan = transaction;
+                return true;
             }
-            if ((startIntersection != null && !(copy.GetNode(startIntersection) is Intersection))
-                || (endIntersection != null && !(copy.GetNode(endIntersection) is Intersection)))
-                return Fail("目标路口已不存在", out reason);
+            finally { copy.Changed -= track; }
+        }
 
-            var a = Endpoint(copy, start, startIntersection != null);
-            var b = Endpoint(copy, end, endIntersection != null);
-            if (a == null || b == null) return Fail("道路端口已被占用或改变", out reason);
-            var segment = copy.AddSegment(a, b, roadId ?? Guid.NewGuid().ToString("N"));
-            if (segment == null) return Fail("道路端口无法连接", out reason);
-            segment.Path = SegmentPathResolver.Restore(SegmentPathResolver.Store(path));
-            segment.ExplicitPath = SegmentPathResolver.Store(segment.Path);
-            transaction.EndProfileId = b.Id;
-            if (startIntersection != null && !Grow(copy, (Intersection)copy.GetNode(startIntersection), a,
-                originalBoundaries[startIntersection], settings, out reason)) return false;
-            if (endIntersection != null && !Grow(copy, (Intersection)copy.GetNode(endIntersection), b,
-                originalBoundaries[endIntersection], settings, out reason)) return false;
-
-            IntersectionBuilder.DetectAndBuild(copy, segment.Id);
-            if (!Validate(transaction, out reason)) return false;
-            copy.Changed -= track;
-            plan = transaction;
-            return true;
+        static Profile Draft(Profile source, LaneDef[] inherited)
+        {
+            var result = Profile.Create(source.Position, source.Direction, (LaneDef[])(inherited ?? source.Lanes).Clone());
+            result.Id = source.Id; result.Y = source.Y; return result;
         }
 
         static Profile Endpoint(RoadGraph graph, Profile candidate, bool intersection)
@@ -159,7 +208,7 @@ namespace RoadSystem.Geometry
             var live = intersection ? null : graph.GetProfile(candidate.Id);
             if (live != null)
             {
-                if (!live.IsLooseEnd || !live.Position.ApproxEquals(candidate.Position)
+                if (!EndpointExtension.TryGetRoad(graph, live.Id, out _) || !live.Position.ApproxEquals(candidate.Position)
                     || !live.Direction.ApproxEquals(candidate.Direction) || !live.HasSameLayout(candidate)) return null;
                 return live;
             }
@@ -277,7 +326,7 @@ namespace RoadSystem.Geometry
 
         static string LinkKey(LaneConnection l) => $"{l.FromPortId}:{l.FromLane}>{l.ToPortId}:{l.ToLane}";
 
-        static bool Validate(RoadBuildPlan plan, out string reason)
+        internal static bool Validate(RoadBuildPlan plan, out string reason)
         {
             reason = null;
             var graph = plan.Result;
@@ -308,7 +357,7 @@ namespace RoadSystem.Geometry
                 foreach (var other in graph.Nodes.Values.OfType<Intersection>())
                     if (other.Id != ix.Id && RoadFootprint.Overlaps(polygon,
                         RoadFootprint.Points(Boundary(graph, other, settings)), tolerance))
-                        return Fail("扩建区域与其他路口重叠", out reason);
+                        return Fail("路口区域与其他路口重叠", out reason);
             }
             var segments = graph.Segments().ToList();
             for (int i = 0; i < segments.Count; i++)

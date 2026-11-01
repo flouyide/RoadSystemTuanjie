@@ -16,13 +16,15 @@ namespace RoadSystem.Meshing
     public static class SegmentMeshBuilder
     {
         public static Mesh Build(PathChain path, LaneDef[] lanes, DVec2 origin,
-            float sagitta = 0.05f, float vPeriod = 6f)
+            float sagitta = 0.05f, float vPeriod = 6f,
+            float endHeightDelta = 0, bool capStart = false, bool capEnd = false)
         {
             var samples = PathSampler.Sample(path, sagitta);
-            return BuildFromSamples(samples, lanes, origin, vPeriod);
+            return BuildFromSamples(samples, lanes, origin, vPeriod, endHeightDelta, capStart, capEnd);
         }
 
-        public static Mesh BuildFromSamples(List<PathPoint> samples, LaneDef[] lanes, DVec2 origin, float vPeriod)
+        public static Mesh BuildFromSamples(List<PathPoint> samples, LaneDef[] lanes, DVec2 origin, float vPeriod,
+            float endHeightDelta = 0, bool capStart = false, bool capEnd = false)
         {
             var verts = new List<Vector3>();
             var normals = new List<Vector3>();
@@ -40,8 +42,11 @@ namespace RoadSystem.Meshing
             var b = new double[lanes.Length + 1];
             for (int i = 0; i < lanes.Length; i++) b[i + 1] = b[i] + lanes[i].Width;
 
-            Vector3 ToWorld(DVec2 p, double y)
-                => new Vector3((float)(p.X - origin.X), (float)y, (float)(p.Y - origin.Y));
+            double length = samples[samples.Count - 1].ArcLength;
+            Vector3 ToWorld(DVec2 p, double y, int sample)
+                => new Vector3((float)(p.X - origin.X),
+                    (float)(y + (length > 1e-6 ? samples[sample].ArcLength / length * endHeightDelta : 0)),
+                    (float)(p.Y - origin.Y));
 
             // 每个采样点的左向单位向量缓存
             var lefts = new DVec2[samples.Count];
@@ -58,8 +63,8 @@ namespace RoadSystem.Meshing
                 for (int i = 0; i < samples.Count; i++)
                 {
                     float v = (float)(samples[i].ArcLength / vPeriod);
-                    verts.Add(ToWorld(Lateral(i, b[lane]), y));
-                    verts.Add(ToWorld(Lateral(i, b[lane + 1]), y));
+                    verts.Add(ToWorld(Lateral(i, b[lane]), y, i));
+                    verts.Add(ToWorld(Lateral(i, b[lane + 1]), y, i));
                     normals.Add(Vector3.up);
                     normals.Add(Vector3.up);
                     uvs.Add(new Vector2((float)(b[lane] / W), v));
@@ -95,10 +100,10 @@ namespace RoadSystem.Meshing
                     var n = new Vector3((float)nDir.X, 0, (float)nDir.Y);
                     float v0 = (float)(samples[i].ArcLength / vPeriod);
                     float v1 = (float)(samples[i + 1].ArcLength / vPeriod);
-                    Vector3 b0 = ToWorld(Lateral(i, t), 0);
-                    Vector3 t0v = ToWorld(Lateral(i, t), h);
-                    Vector3 b1 = ToWorld(Lateral(i + 1, t), 0);
-                    Vector3 t1v = ToWorld(Lateral(i + 1, t), h);
+                    Vector3 b0 = ToWorld(Lateral(i, t), 0, i);
+                    Vector3 t0v = ToWorld(Lateral(i, t), h, i);
+                    Vector3 b1 = ToWorld(Lateral(i + 1, t), 0, i + 1);
+                    Vector3 t1v = ToWorld(Lateral(i + 1, t), h, i + 1);
                     AddQuad(verts, normals, uvs, tris, b0, t0v, b1, t1v, n, u, v0, v1);
                 }
             }
@@ -118,11 +123,29 @@ namespace RoadSystem.Meshing
                     var n = new Vector3((float)nDir.X, 0, (float)nDir.Y);
                     float v0 = (float)(samples[i].ArcLength / vPeriod);
                     float v1 = (float)(samples[i + 1].ArcLength / vPeriod);
-                    Vector3 t0v = ToWorld(Lateral(i, t), topY);
-                    Vector3 b0 = ToWorld(Lateral(i, t), 0);
-                    Vector3 t1v = ToWorld(Lateral(i + 1, t), topY);
-                    Vector3 b1 = ToWorld(Lateral(i + 1, t), 0);
+                    Vector3 t0v = ToWorld(Lateral(i, t), topY, i);
+                    Vector3 b0 = ToWorld(Lateral(i, t), 0, i);
+                    Vector3 t1v = ToWorld(Lateral(i + 1, t), topY, i + 1);
+                    Vector3 b1 = ToWorld(Lateral(i + 1, t), 0, i + 1);
                     AddQuad(verts, normals, uvs, tris, t0v, b0, t1v, b1, n, u, v0, v1);
+                }
+            }
+
+            // Close the raised sidewalks at newly exposed road ends.
+            for (int end = 0; end < 2; end++)
+            {
+                if (end == 0 ? !capStart : !capEnd) continue;
+                int sample = end == 0 ? 0 : samples.Count - 1;
+                var direction = samples[sample].Tangent * (end == 0 ? -1 : 1);
+                var normal = new Vector3((float)direction.X, 0, (float)direction.Y);
+                for (int lane = 0; lane < lanes.Length; lane++)
+                {
+                    float height = lanes[lane].Type == LaneType.Sidewalk ? lanes[lane].CurbHeight : 0;
+                    if (height <= 1e-4) continue;
+                    var left = Lateral(sample, b[lane]); var right = Lateral(sample, b[lane + 1]);
+                    AddQuad(verts, normals, uvs, tris, ToWorld(left, 0, sample), ToWorld(left, height, sample),
+                        ToWorld(right, 0, sample), ToWorld(right, height, sample), normal,
+                        (float)(b[lane] / W), 0, height / vPeriod);
                 }
             }
 

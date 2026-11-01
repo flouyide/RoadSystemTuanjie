@@ -728,6 +728,7 @@ namespace RoadSystem.Geometry
         // ================================================================
 
         /// <summary>ports 少于 3 个的路口合并回普通路段（删段后调用）；2 口时两半段重新连成一段。</summary>
+        [Obsolete("Legacy low-level operation; gameplay deletion must use RoadDeletePlanner and an atomic host commit.")]
         public static void MergeDegenerate(RoadGraph g, string intersectionId)
         {
             if (!(g.GetNode(intersectionId) is Intersection ix)) return;

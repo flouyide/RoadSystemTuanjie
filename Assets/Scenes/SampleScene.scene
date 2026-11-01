@@ -1377,8 +1377,13 @@ MonoBehaviour:
   gridSnap: 0
   minSegmentLength: 1
   previewLift: 0.03
+  IntersectionCurve: 0
   previewOkColor: {r: 0.2, g: 0.9, b: 1, a: 0.45}
   previewBadColor: {r: 1, g: 0.35, b: 0.2, a: 0.45}
+  deletionRaycastMask:
+    serializedVersion: 2
+    m_Bits: 115
+  deleteHighlightColor: {r: 1, g: 0.65, b: 0.1, a: 0.65}
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
